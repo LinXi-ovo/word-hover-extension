@@ -1,0 +1,10 @@
+# Never commit local secrets or editor/OS junk
+.env
+*.key
+*.pem
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+node_modules/

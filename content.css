@@ -1,0 +1,34 @@
+.dsh-term {
+  background: linear-gradient(transparent 60%, #fde68a 60%);
+  cursor: help;
+}
+#dsh-tip {
+  position: fixed;
+  z-index: 2147483647;
+  display: none;
+  pointer-events: none;
+  max-width: 320px;
+  background: #111827;
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font: 13px/1.5 "Microsoft YaHei", "Segoe UI", sans-serif;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .3);
+}
+#dsh-tip b { color: #fde68a; margin-right: 6px; }
+#dsh-tip.phrase b { color: #86efac; }
+#dsh-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  display: none;
+  background: #1e3a8a;
+  color: #fff;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font: 13px/1.4 "Microsoft YaHei", sans-serif;
+}
+::highlight(dsh-hover) {
+  background-color: #e0e7ff;
+}

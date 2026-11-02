@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Word Hover 释义助手",
+  "version": "0.1.0",
+  "description": "点击扩展图标分析当前网页，悬停任意英文单词或短语即可查看中文释义。",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": ["https://*/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Word Hover 释义助手" }
+}
