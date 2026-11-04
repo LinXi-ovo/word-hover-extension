@@ -7,7 +7,11 @@
   const memCache = new Map(); // word -> zh, for this page only
   const WORD_RE = /[A-Za-z][A-Za-z'’-]*/g;
   const sentCache = new Map(); // sentence -> zh, for this page only
-  const SENT_END = /[.!?;。！？]/;
+  const BLOCK_TAGS = new Set(['P', 'LI', 'DD', 'DT', 'TD', 'TH', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'BLOCKQUOTE', 'FIGCAPTION', 'DIV', 'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'MAIN', 'LABEL', 'SUMMARY', 'FIGURE']);
+  // Abbreviations whose trailing period does not end a sentence
+  const ABBR = new Set(['e.g', 'i.e', 'vs', 'etc', 'dr', 'mr', 'mrs', 'ms', 'st', 'no', 'fig', 'approx', 'u.s', 'u.k', 'a.m', 'p.m']);
+  const CLOSERS = '"\'”’)]）】';
   let lastKey = '';
   let sentKey = '';
   let reqId = 0;
@@ -150,29 +154,100 @@
     return null;
   }
 
-  // Sentence under the pointer: text between sentence-ending punctuation in the same text node
+  // Nearest block-level ancestor: sentences are split within it, so they can span inline tags
+  function blockOf(node) {
+    let el = node.parentElement;
+    while (el && el !== document.body && !BLOCK_TAGS.has(el.tagName)) el = el.parentElement;
+    return el || document.body;
+  }
+
+  function textNodesIn(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const p = node.parentElement;
+        if (!p || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        for (let el = p; el; el = el.parentElement) {
+          if (SKIP_TAGS.has(el.tagName) || el.isContentEditable || isInsideOurUI(el)) return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const out = [];
+    let n;
+    while ((n = walker.nextNode())) out.push(n);
+    return out;
+  }
+
+  // If position i in s is the end of a sentence, return the index just after it (including closing quotes); else -1
+  function boundaryEnd(s, i) {
+    const ch = s[i];
+    if (!/[.!?。！？]/.test(ch)) return -1;
+    let j = i + 1;
+    while (j < s.length && CLOSERS.includes(s[j])) j++;
+    if (/[。！？]/.test(ch)) return j;
+    // Must be followed by whitespace or end of block: rules out decimals like "2.2" and "U.S.A"
+    if (j < s.length && !/\s/.test(s[j])) return -1;
+    if (ch === '.') {
+      const before = /([A-Za-z.]+)$/.exec(s.slice(0, i));
+      if (before) {
+        const w = before[1];
+        if (w.length === 1 || ABBR.has(w.toLowerCase())) return -1; // "J. Smith", "e.g.", "Dr."
+      }
+    }
+    return j;
+  }
+
+  // Sentence under the pointer, using the whole block's text so sentences can cross inline tags
   function sentenceAt(x, y) {
     const c = caretAt(x, y);
     if (!c || c.node.nodeType !== Node.TEXT_NODE) return null;
-    const text = c.node.nodeValue;
-    const off = Math.min(c.offset, text.length);
-    let s = 0;
-    for (let i = off - 1; i >= 0; i--) { if (SENT_END.test(text[i])) { s = i + 1; break; } }
-    let e = text.length;
-    for (let i = off; i < text.length; i++) { if (SENT_END.test(text[i])) { e = i + 1; break; } }
-    let a = s, b = e;
-    while (a < b && /\s/.test(text[a])) a++;
-    while (b > a && /\s/.test(text[b - 1])) b--;
-    const sentence = text.slice(a, b);
-    if (!/[A-Za-z]{2,}/.test(sentence)) return null;
+    const nodes = textNodesIn(blockOf(c.node));
+    const k = nodes.indexOf(c.node);
+    if (k < 0) return null;
+
+    const starts = [];
+    let full = '';
+    for (const n of nodes) { starts.push(full.length); full += n.nodeValue; }
+    const p = starts[k] + Math.min(c.offset, c.node.nodeValue.length);
+
+    // Start: after the last sentence boundary before the caret
+    let a = 0;
+    for (let i = p - 1; i >= 0; i--) {
+      const be = boundaryEnd(full, i);
+      if (be >= 0) { a = be; break; }
+    }
+    // End: after the first sentence boundary at or after the caret
+    let b = full.length;
+    for (let i = p; i < full.length; i++) {
+      const be = boundaryEnd(full, i);
+      if (be >= 0) { b = be; break; }
+    }
+    while (a < b && /\s/.test(full[a])) a++;
+    while (b > a && /\s/.test(full[b - 1])) b--;
+    const sentence = full.slice(a, b);
+    if (!sentence || !/[A-Za-z]{2,}/.test(sentence)) return null;
+
+    // Map global offsets back to DOM positions
+    const locate = (pos, isEnd) => {
+      for (let idx = 0; idx < nodes.length; idx++) {
+        const s0 = starts[idx];
+        const len = nodes[idx].nodeValue.length;
+        if (pos < s0 + len || (isEnd && pos === s0 + len)) return { node: nodes[idx], offset: pos - s0 };
+      }
+      return null;
+    };
+    const from = locate(a, false);
+    const to = locate(b, true);
+    if (!from || !to) return null;
     const range = document.createRange();
-    range.setStart(c.node, a);
-    range.setEnd(c.node, b);
-    // Make sure the pointer is really over this sentence, not just near it
+    range.setStart(from.node, from.offset);
+    range.setEnd(to.node, to.offset);
+
+    // Only treat it as hovered if the pointer is actually over the sentence's text
     const over = Array.from(range.getClientRects()).some(r =>
       x >= r.left - 2 && x <= r.right + 2 && y >= r.top - 2 && y <= r.bottom + 2);
     if (!over) return null;
-    return { text: sentence.slice(0, 600), range };
+    return { text: sentence.slice(0, 1200), range };
   }
 
   function place() {
@@ -220,17 +295,25 @@
     }
     showTip('句意', '翻译中…', false);
     const id = ++reqId;
-    chrome.runtime.sendMessage({ type: 'sentence', text: key }, res => {
-      if (id !== reqId || sentKey !== key) return; // stale response
-      if (chrome.runtime.lastError || !res) {
-        showTip('句意', '翻译失败', false);
-      } else if (res.error) {
-        showTip('句意', '错误：' + res.error, false);
-      } else {
-        sentCache.set(key, res.zh);
-        showTip('句意', res.zh, false);
-      }
-    });
+    try {
+      chrome.runtime.sendMessage({ type: 'sentence', text: key }, res => {
+        if (id !== reqId || sentKey !== key) return; // stale response
+        if (chrome.runtime.lastError) {
+          // Usually: the extension was reloaded and this page needs a refresh
+          showTip('句意', '失败：' + chrome.runtime.lastError.message, false);
+        } else if (!res) {
+          showTip('句意', '失败：后台无响应', false);
+        } else if (res.error) {
+          showTip('句意', '失败：' + res.error, false);
+        } else {
+          sentCache.set(key, res.zh);
+          showTip('句意', res.zh, false);
+        }
+      });
+    } catch (err) {
+      // Thrown when this content script is orphaned by an extension reload
+      showTip('句意', '失败：请刷新页面后重试（' + err.message + '）', false);
+    }
   }
 
   function setHL(range) {
