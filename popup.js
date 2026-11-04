@@ -1,13 +1,24 @@
 const $ = id => document.getElementById(id);
 const DEFAULTS = { apiKey: '', endpoint: 'https://api.deepseek.com/chat/completions', model: 'deepseek-chat' };
 
-// Current form values (may not be saved yet); used by the settings tools
+// Current form values (may not be saved yet)
 function formCfg() {
   return {
     apiKey: $('apiKey').value.trim(),
-    endpoint: $('endpoint').value.trim(),
-    model: $('model').value.trim()
+    endpoint: $('endpoint').value.trim() || DEFAULTS.endpoint,
+    model: $('model').value.trim() || DEFAULTS.model
   };
+}
+
+// Base URL without /chat/completions, e.g. https://host/v1
+function baseUrl(url) {
+  return String(url || '').trim().replace(/\/+$/, '').replace(/\/chat\/completions$/, '') || 'https://api.deepseek.com';
+}
+
+// Full chat-completions URL from either a base URL or a full URL
+function chatUrl(url) {
+  const u = String(url || '').trim().replace(/\/+$/, '');
+  return /\/chat\/completions$/.test(u) ? u : u + '/chat/completions';
 }
 
 function setDiag(text, kind) {
@@ -16,48 +27,76 @@ function setDiag(text, kind) {
   d.className = kind || '';
 }
 
-// Run an async action with the buttons disabled, so repeated clicks don't stack requests
-async function busy(btnIds, fn) {
-  btnIds.forEach(id => { $(id).disabled = true; });
+// Run an action with the buttons disabled, so repeated clicks don't stack requests
+async function busy(fn) {
+  const ids = ['fetchModels', 'testConn', 'speedTest'];
+  ids.forEach(id => { $(id).disabled = true; });
   try {
     await fn();
   } finally {
-    btnIds.forEach(id => { $(id).disabled = false; });
+    ids.forEach(id => { $(id).disabled = false; });
   }
 }
 
-function sendBg(msg) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(msg, res => {
-      if (chrome.runtime.lastError) {
-        return reject(new Error(chrome.runtime.lastError.message +
-          '。后台可能是旧版本，请到 chrome://extensions 点击“重新加载”，然后关闭并重新打开弹窗'));
-      }
-      if (!res) return reject(new Error('后台无响应，请重新加载扩展'));
-      if (res.error) return reject(new Error(res.error));
-      resolve(res);
-    });
-  });
-}
-
-// Show the popup version next to the background version, so stale installs are obvious
-(async () => {
-  const popupVersion = chrome.runtime.getManifest().version;
+// Direct fetch from the popup page (host_permissions cover https://*/*), with timing and a 60 s timeout
+async function timedFetch(url, init) {
+  const t0 = performance.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 60000);
   try {
-    const { version } = await sendBg({ type: 'version' });
-    $('status').textContent = version === popupVersion
-      ? `版本 ${version}（后台已同步）`
-      : `版本不一致：弹窗 ${popupVersion}，后台 ${version}。请重新加载扩展`;
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text, ms: Math.round(performance.now() - t0) };
   } catch (err) {
-    $('status').textContent = '后台未连接：' + err.message;
+    if (err.name === 'AbortError') throw new Error('请求超时（60 秒无响应）');
+    throw new Error('网络请求失败：' + err.message);
+  } finally {
+    clearTimeout(timer);
   }
-})();
+}
+
+function requireKey(cfg) {
+  if (!cfg.apiKey) throw new Error('未填写 API Key');
+}
+
+async function listModels(cfg) {
+  const r = await timedFetch(baseUrl(cfg.endpoint) + '/models', {
+    headers: { Authorization: 'Bearer ' + cfg.apiKey }
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}：${r.text.slice(0, 160)}`);
+  let data;
+  try { data = JSON.parse(r.text); } catch (_) { throw new Error('模型列表不是 JSON，该接口可能不支持 /models'); }
+  const models = Array.isArray(data.data) ? data.data.map(m => m.id).filter(Boolean) : [];
+  return { models, ms: r.ms };
+}
+
+// One minimal chat request
+async function chatPing(cfg) {
+  const r = await timedFetch(chatUrl(cfg.endpoint), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.apiKey },
+    body: JSON.stringify({
+      model: cfg.model,
+      messages: [{ role: 'user', content: 'Reply with OK.' }],
+      max_tokens: 256,
+      temperature: 0
+    })
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}：${r.text.slice(0, 160)}`);
+  let data;
+  try { data = JSON.parse(r.text); } catch (_) { throw new Error('响应不是 JSON'); }
+  const choice = data.choices && data.choices[0];
+  if (!choice) throw new Error('响应中没有 choices，接口格式可能不兼容');
+  const reply = (choice.message && choice.message.content) || '';
+  return { ms: r.ms, finish: choice.finish_reason, reply, model: data.model || cfg.model };
+}
 
 (async () => {
   const cfg = await chrome.storage.local.get(DEFAULTS);
   $('apiKey').value = cfg.apiKey;
   $('endpoint').value = cfg.endpoint;
   $('model').value = cfg.model;
+  $('status').textContent = `Word Hover 释义助手 ${chrome.runtime.getManifest().version}`;
 })();
 
 $('save').addEventListener('click', async () => {
@@ -70,10 +109,12 @@ $('save').addEventListener('click', async () => {
 });
 
 // 1) Fetch model list into the model-name suggestions
-$('fetchModels').addEventListener('click', () => busy(['fetchModels', 'testConn', 'speedTest'], async () => {
+$('fetchModels').addEventListener('click', () => busy(async () => {
   setDiag('正在获取模型列表…');
   try {
-    const res = await sendBg({ type: 'listModels', cfg: formCfg() });
+    const cfg = formCfg();
+    requireKey(cfg);
+    const res = await listModels(cfg);
     const list = $('modelList');
     list.textContent = '';
     res.models.forEach(id => {
@@ -88,30 +129,35 @@ $('fetchModels').addEventListener('click', () => busy(['fetchModels', 'testConn'
 }));
 
 // 2) Connectivity: one real chat request must succeed
-$('testConn').addEventListener('click', () => busy(['fetchModels', 'testConn', 'speedTest'], async () => {
+$('testConn').addEventListener('click', () => busy(async () => {
   setDiag('正在测试连通性…');
   try {
-    const res = await sendBg({ type: 'testConnection', cfg: formCfg() });
-    const lines = [
+    const cfg = formCfg();
+    requireKey(cfg);
+    const res = await chatPing(cfg);
+    const hasText = !!res.reply.trim();
+    setDiag([
       '连通性：通过 ✓',
       `耗时：${res.ms} ms`,
       `模型：${res.model}`,
       `结束原因：${res.finish}`,
-      res.hasText ? '返回了文本内容' : '警告：返回内容为空（推理模型可能用完输出额度）'
-    ];
-    setDiag(lines.join('\n'), res.hasText ? 'ok' : 'err');
+      hasText ? '返回了文本内容' : '警告：返回内容为空（推理模型可能用完输出额度）'
+    ].join('\n'), hasText ? 'ok' : 'err');
   } catch (err) {
     setDiag('连通性：失败 ✗\n' + err.message, 'err');
   }
 }));
 
-// 3) Speed: three separate short requests (each its own message), then stats
-$('speedTest').addEventListener('click', () => busy(['fetchModels', 'testConn', 'speedTest'], async () => {
+// 3) Speed: three sequential requests, then stats
+$('speedTest').addEventListener('click', () => busy(async () => {
   const runs = [];
+  let step = 1;
   try {
-    for (let i = 1; i <= 3; i++) {
-      setDiag(`速度测试：第 ${i}/3 次请求中…`);
-      const res = await sendBg({ type: 'pingOnce', cfg: formCfg() });
+    const cfg = formCfg();
+    requireKey(cfg);
+    for (; step <= 3; step++) {
+      setDiag(`速度测试：第 ${step}/3 次请求中…`);
+      const res = await chatPing(cfg);
       runs.push(res.ms);
     }
     const avg = Math.round(runs.reduce((a, b) => a + b, 0) / runs.length);
@@ -121,7 +167,7 @@ $('speedTest').addEventListener('click', () => busy(['fetchModels', 'testConn', 
       `最快 ${Math.min(...runs)} ms · 最慢 ${Math.max(...runs)} ms · 平均 ${avg} ms`
     ].join('\n'), 'ok');
   } catch (err) {
-    setDiag(`速度测试在第 ${runs.length + 1}/3 次失败：` + err.message, 'err');
+    setDiag(`速度测试在第 ${step}/3 次失败：` + err.message, 'err');
   }
 }));
 
