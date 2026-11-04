@@ -89,18 +89,23 @@ $('testConn').addEventListener('click', () => busy(['fetchModels', 'testConn', '
   }
 }));
 
-// 3) Speed: three sequential requests, report each and the stats
+// 3) Speed: three separate short requests (each its own message), then stats
 $('speedTest').addEventListener('click', () => busy(['fetchModels', 'testConn', 'speedTest'], async () => {
-  setDiag('正在做速度测试（发送 3 次请求）…');
+  const runs = [];
   try {
-    const res = await sendBg({ type: 'speedTest', cfg: formCfg() });
+    for (let i = 1; i <= 3; i++) {
+      setDiag(`速度测试：第 ${i}/3 次请求中…`);
+      const res = await sendBg({ type: 'pingOnce', cfg: formCfg() });
+      runs.push(res.ms);
+    }
+    const avg = Math.round(runs.reduce((a, b) => a + b, 0) / runs.length);
     setDiag([
       '速度测试完成',
-      `第 1/2/3 次：${res.runs.map(ms => ms + ' ms').join('  ')}`,
-      `最快 ${res.min} ms · 最慢 ${res.max} ms · 平均 ${res.avg} ms`
+      `第 1/2/3 次：${runs.map(ms => ms + ' ms').join('  ')}`,
+      `最快 ${Math.min(...runs)} ms · 最慢 ${Math.max(...runs)} ms · 平均 ${avg} ms`
     ].join('\n'), 'ok');
   } catch (err) {
-    setDiag('速度测试失败：' + err.message, 'err');
+    setDiag(`速度测试在第 ${runs.length + 1}/3 次失败：` + err.message, 'err');
   }
 }));
 

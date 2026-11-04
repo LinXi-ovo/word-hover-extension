@@ -9,7 +9,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Settings-page tools: they use the form values passed in msg.cfg (not yet saved)
   if (msg.type === 'listModels') task = listModels(msg);
   if (msg.type === 'testConnection') task = testConnection(msg);
-  if (msg.type === 'speedTest') task = speedTest(msg);
+  if (msg.type === 'pingOnce') task = pingOnce(msg); // one short request per message (speed test loops in the popup)
   if (!task) return false;
   task.then(sendResponse).catch(err => sendResponse({ error: err.message }));
   return true; // keep the channel open for the async response
@@ -84,14 +84,18 @@ async function getCfg(override) {
 // fetch with wall-clock timing; reads the body so the timing covers the full response
 async function timedFetch(url, init) {
   const t0 = performance.now();
-  let res;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 60000); // never let one request hang the worker
   try {
-    res = await fetch(url, init);
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text, ms: Math.round(performance.now() - t0) };
   } catch (err) {
+    if (err.name === 'AbortError') throw new Error('请求超时（60 秒无响应）');
     throw new Error('网络请求失败：' + err.message + '（检查地址是否可访问，或证书/代理问题）');
+  } finally {
+    clearTimeout(timer);
   }
-  const text = await res.text();
-  return { ok: res.ok, status: res.status, text, ms: Math.round(performance.now() - t0) };
 }
 
 // GET {base}/models
@@ -134,16 +138,11 @@ async function testConnection(msg) {
   return { ms: p.ms, model: p.model, finish: p.finish, hasText: !!p.reply.trim() };
 }
 
-// Speed: three sequential chat requests; reports each run plus min/avg/max
-async function speedTest(msg) {
+// Speed: a single timed request; the popup repeats this three times
+async function pingOnce(msg) {
   const cfg = await getCfg(msg.cfg);
-  const runs = [];
-  for (let i = 0; i < 3; i++) {
-    const p = await chatPing(cfg);
-    runs.push(p.ms);
-  }
-  const avg = Math.round(runs.reduce((a, b) => a + b, 0) / runs.length);
-  return { runs, min: Math.min(...runs), max: Math.max(...runs), avg };
+  const p = await chatPing(cfg);
+  return { ms: p.ms };
 }
 
 // Translate one sentence into natural Chinese, cached in chrome.storage.local
