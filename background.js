@@ -28,7 +28,7 @@ function normalizeEndpoint(url) {
   return u + '/chat/completions';
 }
 
-async function callJSON(prompt) {
+async function callJSON(prompt, maxTokens = 4096) {
   const cfg = await chrome.storage.local.get({ apiKey: '', endpoint: DEFAULTS.endpoint, model: DEFAULTS.model });
   if (!cfg.apiKey) throw new Error('未设置 API Key，请点击扩展图标填写');
   const res = await fetch(normalizeEndpoint(cfg.endpoint), {
@@ -42,7 +42,7 @@ async function callJSON(prompt) {
       ],
       response_format: { type: 'json_object' },
       temperature: 0.2,
-      max_tokens: 4096 // reasoning models consume output budget; leave room for the JSON answer
+      max_tokens: maxTokens // reasoning models consume output budget; leave room for the JSON answer
     })
   });
   if (!res.ok) throw new Error(`API ${res.status}: ${(await res.text()).slice(0, 160)}`);
@@ -167,10 +167,11 @@ async function sentence({ text }) {
 // Pick learnable words/phrases in a chunk of page text
 async function annotate({ text }) {
   const out = await callJSON(
-    'From the English text below, pick up to 25 words or phrases worth learning. ' +
+    'From the English text below, pick up to 12 words or phrases worth learning. ' +
     'Each "text" must be copied verbatim from the input (same spelling and case). ' +
     'Each "zh" is a short Chinese meaning in this context. ' +
-    'Return JSON {"items":[{"text":"...","zh":"..."}]}.\n\nTEXT:\n"""' + text + '"""'
+    'Return JSON {"items":[{"text":"...","zh":"..."}]}.\n\nTEXT:\n"""' + text + '"""',
+    16000 // annotation is the heaviest call; a reasoning model needs a much larger budget
   );
   const items = Array.isArray(out.items)
     ? out.items.filter(i => i && typeof i.text === 'string' && typeof i.zh === 'string')
