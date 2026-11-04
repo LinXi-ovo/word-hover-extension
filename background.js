@@ -5,6 +5,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   let task = null;
   if (msg.type === 'lookup') task = lookup(msg);
   if (msg.type === 'annotate') task = annotate(msg);
+  if (msg.type === 'sentence') task = sentence(msg);
   if (!task) return false;
   task.then(sendResponse).catch(err => sendResponse({ error: err.message }));
   return true; // keep the channel open for the async response
@@ -53,6 +54,20 @@ async function lookup({ word, context }) {
     `as used in this sentence: """${context}""". Return JSON {"zh": "..."}.`
   );
   const zh = String(out.zh || '').trim() || '暂无释义';
+  await chrome.storage.local.set({ [key]: zh });
+  return { zh };
+}
+
+// Translate one sentence into natural Chinese, cached in chrome.storage.local
+async function sentence({ text }) {
+  const key = 's:' + text;
+  const cached = (await chrome.storage.local.get(key))[key];
+  if (cached) return { zh: cached };
+  const out = await callJSON(
+    'Translate the English sentence below into natural, accurate Chinese. ' +
+    'Return JSON {"zh": "..."}.\n\nSENTENCE:\n"""' + text + '"""'
+  );
+  const zh = String(out.zh || '').trim() || '暂无译文';
   await chrome.storage.local.set({ [key]: zh });
   return { zh };
 }

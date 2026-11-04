@@ -6,7 +6,10 @@
   const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'CODE', 'PRE', 'SVG', 'CANVAS', 'SELECT', 'BUTTON']);
   const memCache = new Map(); // word -> zh, for this page only
   const WORD_RE = /[A-Za-z][A-Za-z'’-]*/g;
+  const sentCache = new Map(); // sentence -> zh, for this page only
+  const SENT_END = /[.!?;。！？]/;
   let lastKey = '';
+  let sentKey = '';
   let reqId = 0;
   let mx = 0, my = 0;
 
@@ -147,6 +150,31 @@
     return null;
   }
 
+  // Sentence under the pointer: text between sentence-ending punctuation in the same text node
+  function sentenceAt(x, y) {
+    const c = caretAt(x, y);
+    if (!c || c.node.nodeType !== Node.TEXT_NODE) return null;
+    const text = c.node.nodeValue;
+    const off = Math.min(c.offset, text.length);
+    let s = 0;
+    for (let i = off - 1; i >= 0; i--) { if (SENT_END.test(text[i])) { s = i + 1; break; } }
+    let e = text.length;
+    for (let i = off; i < text.length; i++) { if (SENT_END.test(text[i])) { e = i + 1; break; } }
+    let a = s, b = e;
+    while (a < b && /\s/.test(text[a])) a++;
+    while (b > a && /\s/.test(text[b - 1])) b--;
+    const sentence = text.slice(a, b);
+    if (!/[A-Za-z]{2,}/.test(sentence)) return null;
+    const range = document.createRange();
+    range.setStart(c.node, a);
+    range.setEnd(c.node, b);
+    // Make sure the pointer is really over this sentence, not just near it
+    const over = Array.from(range.getClientRects()).some(r =>
+      x >= r.left - 2 && x <= r.right + 2 && y >= r.top - 2 && y <= r.bottom + 2);
+    if (!over) return null;
+    return { text: sentence.slice(0, 600), range };
+  }
+
   function place() {
     const pad = 14;
     const r = tip.getBoundingClientRect();
@@ -173,7 +201,36 @@
   function hideTip() {
     tip.style.display = 'none';
     lastKey = '';
+    sentKey = '';
     if (hasHL) CSS.highlights.delete('dsh-hover');
+  }
+
+  // Shift mode: show the Chinese translation of the sentence under the pointer
+  function sentenceMode(x, y) {
+    const s = sentenceAt(x, y);
+    if (!s) { hideTip(); return; }
+    const key = s.text;
+    setHL(s.range);
+    if (key === sentKey) { place(); return; }
+    sentKey = key;
+    lastKey = '';
+    if (sentCache.has(key)) {
+      showTip('句意', sentCache.get(key), false);
+      return;
+    }
+    showTip('句意', '翻译中…', false);
+    const id = ++reqId;
+    chrome.runtime.sendMessage({ type: 'sentence', text: key }, res => {
+      if (id !== reqId || sentKey !== key) return; // stale response
+      if (chrome.runtime.lastError || !res) {
+        showTip('句意', '翻译失败', false);
+      } else if (res.error) {
+        showTip('句意', '错误：' + res.error, false);
+      } else {
+        sentCache.set(key, res.zh);
+        showTip('句意', res.zh, false);
+      }
+    });
   }
 
   function setHL(range) {
@@ -183,6 +240,10 @@
   document.addEventListener('mousemove', e => {
     mx = e.clientX;
     my = e.clientY;
+
+    // Hold Shift: sentence meaning mode
+    if (e.shiftKey) { sentenceMode(mx, my); return; }
+    sentKey = '';
 
     const term = phraseAt(mx, my);
     if (term) {
@@ -222,6 +283,15 @@
   });
 
   document.addEventListener('scroll', hideTip, true);
+
+  // Pressing Shift switches to sentence mode immediately; releasing returns to word mode
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Shift' && !e.repeat) sentenceMode(mx, my);
+  });
+  document.addEventListener('keyup', e => {
+    if (e.key === 'Shift') hideTip();
+  });
+  window.addEventListener('blur', hideTip);
 
   // Started by the popup after injection
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
