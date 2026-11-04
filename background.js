@@ -10,7 +10,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'listModels') task = listModels(msg);
   if (msg.type === 'testConnection') task = testConnection(msg);
   if (msg.type === 'pingOnce') task = pingOnce(msg); // one short request per message (speed test loops in the popup)
-  if (!task) return false;
+  if (msg.type === 'version') task = Promise.resolve({ version: chrome.runtime.getManifest().version });
+  if (!task) {
+    // Unknown message: always answer, otherwise the popup sees "message port closed"
+    sendResponse({ error: '后台不认识消息类型 "' + msg.type + '"，请到 chrome://extensions 重新加载扩展' });
+    return false;
+  }
   task.then(sendResponse).catch(err => sendResponse({ error: err.message }));
   return true; // keep the channel open for the async response
 });

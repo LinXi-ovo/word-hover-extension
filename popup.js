@@ -29,13 +29,29 @@ async function busy(btnIds, fn) {
 function sendBg(msg) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(msg, res => {
-      if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-      if (!res) return reject(new Error('后台无响应'));
+      if (chrome.runtime.lastError) {
+        return reject(new Error(chrome.runtime.lastError.message +
+          '。后台可能是旧版本，请到 chrome://extensions 点击“重新加载”，然后关闭并重新打开弹窗'));
+      }
+      if (!res) return reject(new Error('后台无响应，请重新加载扩展'));
       if (res.error) return reject(new Error(res.error));
       resolve(res);
     });
   });
 }
+
+// Show the popup version next to the background version, so stale installs are obvious
+(async () => {
+  const popupVersion = chrome.runtime.getManifest().version;
+  try {
+    const { version } = await sendBg({ type: 'version' });
+    $('status').textContent = version === popupVersion
+      ? `版本 ${version}（后台已同步）`
+      : `版本不一致：弹窗 ${popupVersion}，后台 ${version}。请重新加载扩展`;
+  } catch (err) {
+    $('status').textContent = '后台未连接：' + err.message;
+  }
+})();
 
 (async () => {
   const cfg = await chrome.storage.local.get(DEFAULTS);
