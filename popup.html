@@ -12,6 +12,10 @@
   button.secondary { background: #6b7280; }
   #status { margin-top: 10px; min-height: 18px; color: #374151; font-size: 12px; }
   .hint { color: #6b7280; font-size: 12px; margin-top: 8px; }
+  #diag { margin-top: 8px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+  #diag.ok { color: #047857; }
+  #diag.err { color: #b91c1c; }
+  button:disabled { opacity: .55; cursor: wait; }
 </style>
 </head>
 <body>
@@ -23,13 +27,20 @@
     <input id="endpoint" type="text">
   </label>
   <label>模型名
-    <input id="model" type="text">
+    <input id="model" type="text" list="modelList">
+    <datalist id="modelList"></datalist>
   </label>
+  <div class="row">
+    <button id="fetchModels" class="secondary">获取模型</button>
+    <button id="testConn" class="secondary">连通性测试</button>
+    <button id="speedTest" class="secondary">速度测试</button>
+  </div>
   <div class="row">
     <button id="save" class="secondary">保存设置</button>
     <button id="run">分析本页</button>
   </div>
   <div id="status"></div>
+  <div id="diag"></div>
   <div class="hint">分析时会把页面文字发送到上面的 API 地址。鼠标悬停任意单词即可查询释义。</div>
   <script src="popup.js"></script>
 </body>

@@ -6,6 +6,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'lookup') task = lookup(msg);
   if (msg.type === 'annotate') task = annotate(msg);
   if (msg.type === 'sentence') task = sentence(msg);
+  // Settings-page tools: they use the form values passed in msg.cfg (not yet saved)
+  if (msg.type === 'listModels') task = listModels(msg);
+  if (msg.type === 'testConnection') task = testConnection(msg);
+  if (msg.type === 'speedTest') task = speedTest(msg);
   if (!task) return false;
   task.then(sendResponse).catch(err => sendResponse({ error: err.message }));
   return true; // keep the channel open for the async response
@@ -56,6 +60,90 @@ async function lookup({ word, context }) {
   const zh = String(out.zh || '').trim() || '暂无释义';
   await chrome.storage.local.set({ [key]: zh });
   return { zh };
+}
+
+// ---------- settings tools: models, connectivity, speed ----------
+
+// Base URL without /chat/completions, e.g. https://host/v1
+function baseUrl(url) {
+  return String(url || '').trim().replace(/\/+$/, '').replace(/\/chat\/completions$/, '') || 'https://api.deepseek.com';
+}
+
+// Merge form values (msg.cfg) over stored settings; form values win when non-empty
+async function getCfg(override) {
+  const cfg = await chrome.storage.local.get({ apiKey: '', endpoint: DEFAULTS.endpoint, model: DEFAULTS.model });
+  if (override) {
+    if (override.apiKey) cfg.apiKey = override.apiKey;
+    if (override.endpoint) cfg.endpoint = override.endpoint;
+    if (override.model) cfg.model = override.model;
+  }
+  if (!cfg.apiKey) throw new Error('未填写 API Key');
+  return cfg;
+}
+
+// fetch with wall-clock timing; reads the body so the timing covers the full response
+async function timedFetch(url, init) {
+  const t0 = performance.now();
+  let res;
+  try {
+    res = await fetch(url, init);
+  } catch (err) {
+    throw new Error('网络请求失败：' + err.message + '（检查地址是否可访问，或证书/代理问题）');
+  }
+  const text = await res.text();
+  return { ok: res.ok, status: res.status, text, ms: Math.round(performance.now() - t0) };
+}
+
+// GET {base}/models
+async function listModels(msg) {
+  const cfg = await getCfg(msg.cfg);
+  const url = baseUrl(cfg.endpoint) + '/models';
+  const r = await timedFetch(url, { headers: { Authorization: 'Bearer ' + cfg.apiKey } });
+  if (!r.ok) throw new Error(`获取模型失败 HTTP ${r.status}：${r.text.slice(0, 160)}`);
+  let data;
+  try { data = JSON.parse(r.text); } catch (_) { throw new Error('模型列表不是 JSON，该接口可能不支持 /models'); }
+  const models = Array.isArray(data.data) ? data.data.map(m => m.id).filter(Boolean) : [];
+  return { models, ms: r.ms };
+}
+
+// One minimal chat request; returns timing and the reply info
+async function chatPing(cfg) {
+  const r = await timedFetch(normalizeEndpoint(cfg.endpoint), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.apiKey },
+    body: JSON.stringify({
+      model: cfg.model,
+      messages: [{ role: 'user', content: 'Reply with OK.' }],
+      max_tokens: 256,
+      temperature: 0
+    })
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}：${r.text.slice(0, 160)}`);
+  let data;
+  try { data = JSON.parse(r.text); } catch (_) { throw new Error('响应不是 JSON'); }
+  const choice = data.choices && data.choices[0];
+  if (!choice) throw new Error('响应中没有 choices，接口格式可能不兼容');
+  const reply = (choice.message && choice.message.content) || '';
+  return { ms: r.ms, finish: choice.finish_reason, reply, model: data.model || cfg.model };
+}
+
+// Connectivity: one request must get a valid chat response
+async function testConnection(msg) {
+  const cfg = await getCfg(msg.cfg);
+  const p = await chatPing(cfg);
+  return { ms: p.ms, model: p.model, finish: p.finish, hasText: !!p.reply.trim() };
+}
+
+// Speed: three sequential chat requests; reports each run plus min/avg/max
+async function speedTest(msg) {
+  const cfg = await getCfg(msg.cfg);
+  const runs = [];
+  for (let i = 0; i < 3; i++) {
+    const p = await chatPing(cfg);
+    runs.push(p.ms);
+  }
+  const avg = Math.round(runs.reduce((a, b) => a + b, 0) / runs.length);
+  return { runs, min: Math.min(...runs), max: Math.max(...runs), avg };
 }
 
 // Translate one sentence into natural Chinese, cached in chrome.storage.local
