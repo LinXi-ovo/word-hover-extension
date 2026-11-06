@@ -1,6 +1,13 @@
 // Service worker: the only place that talks to the LLM API (keeps the API key out of page scripts).
 const DEFAULTS = { endpoint: 'https://api.deepseek.com/chat/completions', model: 'deepseek-chat' };
 
+// Short, stable cache key for long context text (FNV-1a, 32-bit)
+function hashKey(s) {
+  let x = 2166136261;
+  for (let i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul(x, 16777619); }
+  return (x >>> 0).toString(36);
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   let task = null;
   if (msg.type === 'lookup') task = lookup(msg);
@@ -54,14 +61,17 @@ async function callJSON(prompt, maxTokens = 4096) {
   return JSON.parse(content);
 }
 
-// Single word / phrase lookup in context, cached in chrome.storage.local
-async function lookup({ word, context }) {
-  const key = 'w:' + word.toLowerCase();
-  const cached = (await chrome.storage.local.get(key))[key];
-  if (cached) return { zh: cached };
+// Single word lookup in its context. The cache is keyed by word AND context, so the same word
+// in another sentence gets its own meaning. force=true skips the cache (middle-click refresh).
+async function lookup({ word, context, force }) {
+  const key = 'w:' + word.toLowerCase() + '|' + hashKey(context || '');
+  if (!force) {
+    const cached = (await chrome.storage.local.get(key))[key];
+    if (cached) return { zh: cached };
+  }
   const out = await callJSON(
-    `Give a concise Chinese meaning (at most 15 Chinese characters) of the English word or phrase "${word}", ` +
-    `as used in this sentence: """${context}""". Return JSON {"zh": "..."}.`
+    `Give a concise Chinese meaning (at most 15 Chinese characters) of the English word "${word}" ` +
+    `as it is used in the sentence that contains it, in this text: """${context}""". Return JSON {"zh": "..."}.`
   );
   const zh = String(out.zh || '').trim() || '暂无释义';
   await chrome.storage.local.set({ [key]: zh });
@@ -168,7 +178,7 @@ async function sentence({ text }) {
 // Ctrl mode: the smallest meaningful unit containing the word (phrasal verb, collocation, phrase).
 // Longer than one word, shorter than the sentence. Cached in chrome.storage.local.
 async function chunk({ word, context }) {
-  const key = 'c:' + word.toLowerCase() + '|' + context;
+  const key = 'c:' + word.toLowerCase() + '|' + hashKey(context);
   const cached = (await chrome.storage.local.get(key))[key];
   if (cached) return cached;
   // Step 1: ask for ALL multi-word units in the text (a list is more reliable than asking about one word)
@@ -183,10 +193,13 @@ async function chunk({ word, context }) {
     .map(u => ({ text: String((u && u.text) || '').trim(), zh: String((u && u.zh) || '').trim() }))
     .filter(u => u.text && u.zh);
 
-  // Step 2: locally pick the shortest unit that contains the word as a whole word
+  // Step 2: locally pick the shortest unit that contains the word as a whole word,
+  // restricted to the sentence that contains the word (never across sentence boundaries)
   const wordRe = new RegExp('(^|[^A-Za-z])' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z]|$)', 'i');
+  const sentences = String(context).split(/(?<=[.!?])\s+/);
+  const ownSentence = sentences.find(s => wordRe.test(s)) || String(context);
   const hits = units
-    .filter(u => /\s/.test(u.text) && wordRe.test(u.text))
+    .filter(u => /\s/.test(u.text) && wordRe.test(u.text) && ownSentence.includes(u.text))
     .sort((a, b) => a.text.split(/\s+/).length - b.text.split(/\s+/).length);
 
   const result = hits.length

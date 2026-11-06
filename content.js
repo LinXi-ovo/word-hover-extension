@@ -419,18 +419,24 @@
     const w = wordAt(mx, my);
     if (!w) { hideTip(); return; }
 
-    const key = w.word.toLowerCase();
+    // Cache key includes the paragraph, so the same word in another sentence is looked up again
+    w.context = paragraphContext(w.range.startContainer);
+    const key = w.word.toLowerCase() + '|' + w.context;
     if (key === lastKey) { place(); return; }
     lastKey = key;
     setHL(w.range);
+    showWordMeaning(w, key, false);
+  });
 
-    if (memCache.has(key)) {
+  // Word meaning in context. force=true ignores the cache (used by middle-click refresh).
+  function showWordMeaning(w, key, force) {
+    if (!force && memCache.has(key)) {
       showTip(w.word, memCache.get(key), false);
       return;
     }
     showTip(w.word, '查询中…', false);
     const id = ++reqId;
-    chrome.runtime.sendMessage({ type: 'lookup', word: w.word, context: w.context }, res => {
+    chrome.runtime.sendMessage({ type: 'lookup', word: w.word, context: w.context, force: !!force }, res => {
       if (id !== reqId || lastKey !== key) return; // stale response
       if (chrome.runtime.lastError || !res) {
         showTip(w.word, '查询失败', false);
@@ -441,7 +447,28 @@
         showTip(w.word, res.zh, false);
       }
     });
-  });
+  }
+
+  // Middle-click a word: drop its cached meaning for this context and query again
+  function refreshWordAt(x, y) {
+    const w = wordAt(x, y);
+    if (!w) return false;
+    mx = x; my = y;
+    w.context = paragraphContext(w.range.startContainer);
+    const key = w.word.toLowerCase() + '|' + w.context;
+    memCache.delete(key);
+    lastKey = key;
+    setHL(w.range);
+    showWordMeaning(w, key, true);
+    return true;
+  }
+  // preventDefault stops the browser's middle-click auto-scroll and link-opening on words
+  document.addEventListener('mousedown', e => {
+    if (e.button === 1 && refreshWordAt(e.clientX, e.clientY)) e.preventDefault();
+  }, true);
+  document.addEventListener('auxclick', e => {
+    if (e.button === 1 && wordAt(e.clientX, e.clientY)) e.preventDefault();
+  }, true);
 
   document.addEventListener('scroll', hideTip, true);
 
