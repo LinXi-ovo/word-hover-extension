@@ -1,5 +1,14 @@
 // Service worker: the only place that talks to the LLM API (keeps the API key out of page scripts).
 const DEFAULTS = { endpoint: 'https://api.deepseek.com/chat/completions', model: 'deepseek-chat' };
+const isLocal = url => {
+  try { return ['localhost', '127.0.0.1'].includes(new URL(url).hostname); }
+  catch (_) { return false; }
+};
+const authHeaders = cfg => cfg.apiKey ? { Authorization: 'Bearer ' + cfg.apiKey } : {};
+async function cacheScope() {
+  const cfg = await chrome.storage.local.get({ endpoint: DEFAULTS.endpoint, model: DEFAULTS.model });
+  return hashKey(normalizeEndpoint(cfg.endpoint) + '|' + cfg.model);
+}
 
 // Short, stable cache key for long context text (FNV-1a, 32-bit)
 function hashKey(s) {
@@ -180,10 +189,10 @@ async function callJSON(prompt, maxTokens = 4096, system = SYS_DEFAULT, tries = 
 
 async function requestJSON(prompt, maxTokens, system) {
   const cfg = await chrome.storage.local.get({ apiKey: '', endpoint: DEFAULTS.endpoint, model: DEFAULTS.model });
-  if (!cfg.apiKey) throw new Error('未设置 API Key，请点击扩展图标填写');
+  if (!cfg.apiKey && !isLocal(cfg.endpoint)) throw new Error('未设置 API Key，请点击扩展图标填写');
   const res = await fetch(normalizeEndpoint(cfg.endpoint), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.apiKey },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(cfg) },
     body: JSON.stringify({
       model: cfg.model,
       messages: [
@@ -209,7 +218,7 @@ async function requestJSON(prompt, maxTokens, system) {
 // force=true (middle-click refresh) asks the AI again; the cache is then updated by cacheSave().
 async function lookupCore({ word, sentence: sent0, context, force }, tries = 2) {
   const sent = String(sent0 || context || '');
-  const key = 'w2:' + word.toLowerCase() + '|' + hashKey(sent);
+  const key = 'w3:' + await cacheScope() + ':' + word.toLowerCase() + '|' + hashKey(sent);
   const prev = await cacheGetRaw(key);
   if (!force && isFresh(prev)) return { zh: prev.v };
   const out = await callJSON(
@@ -237,7 +246,7 @@ async function getCfg(override) {
     if (override.endpoint) cfg.endpoint = override.endpoint;
     if (override.model) cfg.model = override.model;
   }
-  if (!cfg.apiKey) throw new Error('未填写 API Key');
+  if (!cfg.apiKey && !isLocal(cfg.endpoint)) throw new Error('未填写 API Key');
   return cfg;
 }
 
@@ -262,7 +271,7 @@ async function timedFetch(url, init) {
 async function listModels(msg) {
   const cfg = await getCfg(msg.cfg);
   const url = baseUrl(cfg.endpoint) + '/models';
-  const r = await timedFetch(url, { headers: { Authorization: 'Bearer ' + cfg.apiKey } });
+  const r = await timedFetch(url, { headers: authHeaders(cfg) });
   if (!r.ok) throw new Error(`获取模型失败 HTTP ${r.status}：${r.text.slice(0, 160)}`);
   let data;
   try { data = JSON.parse(r.text); } catch (_) { throw new Error('模型列表不是 JSON，该接口可能不支持 /models'); }
@@ -274,7 +283,7 @@ async function listModels(msg) {
 async function chatPing(cfg) {
   const r = await timedFetch(normalizeEndpoint(cfg.endpoint), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.apiKey },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(cfg) },
     body: JSON.stringify({
       model: cfg.model,
       messages: [{ role: 'user', content: 'Reply with OK.' }],
@@ -307,7 +316,7 @@ async function pingOnce(msg) {
 
 // Translate one sentence into natural Chinese, cached in chrome.storage.local
 async function sentenceCore({ text }, tries = 2) {
-  const key = 's2:' + String(text).length + '.' + hashKey(text);
+  const key = 's3:' + await cacheScope() + ':' + String(text).length + '.' + hashKey(text);
   const prev = await cacheGetRaw(key);
   if (isFresh(prev)) return { zh: prev.v };
   const out = await callJSON(
@@ -328,7 +337,7 @@ const SYS_SEG = 'You are an English grammar analyst. You split sentences into co
 async function segmentCore({ sentence: sent }, tries = 2) {
   const text = String(sent || '').trim();
   if (!text) throw new Error('句子为空');
-  const key = 'seg2:' + text.length + '.' + hashKey(text);
+  const key = 'seg3:' + await cacheScope() + ':' + text.length + '.' + hashKey(text);
   const prev = await cacheGetRaw(key);
   if (isFresh(prev)) return { segments: prev.v };
 
@@ -394,7 +403,7 @@ async function annotate({ text }) {
 // Article annotations are also reusable after a reload. Key by the exact chunk text.
 async function annotateCached({ text }) {
   const source = String(text || '');
-  const key = 'a1:' + source.length + '.' + hashKey(source);
+  const key = 'a2:' + await cacheScope() + ':' + source.length + '.' + hashKey(source);
   const prev = await cacheGetRaw(key);
   if (isFresh(prev)) return { items: prev.v };
   const result = await annotate({ text: source });

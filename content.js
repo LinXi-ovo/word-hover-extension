@@ -18,6 +18,7 @@
   let chunkKey = ''; // Ctrl mode: word|context currently being shown
   let renderedChunkKey = '';
   let reqId = 0;
+  let modelEpoch = 0;
   let mx = 0, my = 0;
   let anchorRect = null;
 
@@ -32,6 +33,17 @@
   // event, and hiding the tip on them would clear the in-flight key and drop the answer as "stale".
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
+    if (['apiKey', 'endpoint', 'model', 'activePresetId'].some(k => k in changes)) {
+      modelEpoch++;
+      reqId++;
+      memCache.clear();
+      sentCache.clear();
+      segCache.clear();
+      hideTip();
+      for (const term of document.querySelectorAll('span.dsh-term[data-zh]')) {
+        term.replaceWith(...Array.from(term.childNodes));
+      }
+    }
     const switched = SWITCHES.filter(k => k in changes);
     if (!switched.length) return;
     switched.forEach(k => { settings[k] = changes[k].newValue; });
@@ -167,10 +179,12 @@
   const MAX_DOC_SENTENCES = 240;
   // prefix: phase-1 result, kept on screen together with the phase-2 status
   function segmentArticle(prefix = '', force = false) {
+    const epoch = modelEpoch;
     const sents = collectSentences().slice(0, MAX_DOC_SENTENCES);
     if (!sents.length) { showToast(prefix, 8000); return; }
     showToast(`${prefix}成分分析中（${sents.length} 句，后台进行）…`);
     askBg({ type: 'segmentDoc', sentences: sents, force }, res => {
+      if (epoch !== modelEpoch) return;
       if (res.error) { showToast(`${prefix}成分分析失败：${res.error}`, 8000); return; }
       let refreshCurrent = false;
       for (const [sentence, segments] of Object.entries(res.segmentsBySentence || {})) {
@@ -376,9 +390,10 @@
     }
     showTip('句意', '翻译中…', false);
     const id = ++reqId;
+    const epoch = modelEpoch;
     try {
       askBg({ type: 'sentence', text: key }, res => {
-        if (id !== reqId || sentKey !== key) return; // stale response
+        if (epoch !== modelEpoch || id !== reqId || sentKey !== key) return; // stale response
         if (res.error) {
           // Usually: the extension was reloaded and this page needs a refresh
           showTip('句意', '失败：' + res.error, false);
@@ -467,7 +482,9 @@
     if (segCache.get(key) === 'pending') return; // the reply will show the tip for the current pointer
 
     segCache.set(key, 'pending');
+    const epoch = modelEpoch;
     askBg({ type: 'segment', sentence: key }, res => {
+      if (epoch !== modelEpoch) return;
       if (res.error) {
         segCache.delete(key);
         if (chunkKey.startsWith(key + '#')) showTip(w.word, '失败：' + res.error, false);
@@ -581,7 +598,9 @@
     }
     showTip(w.word, '查询中…', false);
     const id = ++reqId;
+    const epoch = modelEpoch;
     askBg({ type: 'lookup', word: w.word, context: w.context, force: !!force }, res => {
+      if (epoch !== modelEpoch) return;
       if (id !== reqId || lastKey !== key) return; // stale response
       if (res.error) {
         showTip(w.word, '错误：' + res.error, false);

@@ -7,6 +7,7 @@
   h1 { font-size: 15px; margin: 0 0 10px; }
   label { display: block; margin-top: 8px; color: #6b7280; font-size: 12px; }
   input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; margin-top: 3px; }
+  select { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; margin-top: 3px; }
   .row { display: flex; gap: 8px; margin-top: 12px; }
   button { flex: 1; padding: 7px; border: 0; border-radius: 6px; cursor: pointer; color: #fff; background: #2563eb; }
   button.secondary { background: #6b7280; }
@@ -24,7 +25,14 @@
 </head>
 <body>
   <h1>Word Hover 释义助手</h1>
-  <label>API Key（仅保存在本机）
+  <label>当前预设<select id="presetSelect"></select></label>
+  <label>预设名称<input id="presetName" type="text" placeholder="例如：DeepSeek / 本机 Ollama"></label>
+  <div class="row">
+    <button id="newPreset" class="secondary">新建预设</button>
+    <button id="ollamaPreset" class="secondary">本机 Ollama</button>
+    <button id="deletePreset" class="secondary">删除预设</button>
+  </div>
+  <label>API Key（本机 Ollama 可留空，仅保存在本机）
     <input id="apiKey" type="password" placeholder="sk-...">
   </label>
   <label>API 地址（OpenAI 兼容）
@@ -56,7 +64,7 @@
   </div>
   <div id="status"></div>
   <div id="diag"></div>
-  <div class="hint">分析时会把页面文字发送到上面的 API 地址。鼠标悬停任意单词即可查询释义。</div>
+  <div class="hint">本机 Ollama 可填 http://localhost:11434/v1，API Key 留空，模型名填已下载的模型。切换预设立即生效；分析时会把页面文字发送到当前接口。</div>
   <script src="popup.js"></script>
 </body>
 </html>

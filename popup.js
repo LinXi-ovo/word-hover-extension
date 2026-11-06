@@ -1,12 +1,46 @@
 const $ = id => document.getElementById(id);
 const DEFAULTS = { apiKey: '', endpoint: 'https://api.deepseek.com/chat/completions', model: 'deepseek-chat' };
+let presets = [];
+let activePresetId = '';
+const isLocal = url => {
+  try { return ['localhost', '127.0.0.1'].includes(new URL(url).hostname); }
+  catch (_) { return false; }
+};
+const authHeaders = cfg => cfg.apiKey ? { Authorization: 'Bearer ' + cfg.apiKey } : {};
+
+function renderPresets() {
+  const select = $('presetSelect');
+  select.textContent = '';
+  for (const preset of presets) {
+    const option = document.createElement('option');
+    option.value = preset.id;
+    option.textContent = preset.name;
+    select.appendChild(option);
+  }
+  select.value = activePresetId;
+}
+
+function showPreset(preset) {
+  $('presetName').value = preset.name;
+  $('apiKey').value = preset.apiKey;
+  $('endpoint').value = preset.endpoint;
+  $('model').value = preset.model;
+  $('modelList').textContent = '';
+}
+
+async function activatePreset(preset) {
+  activePresetId = preset.id;
+  showPreset(preset);
+  renderPresets();
+  await chrome.storage.local.set({ activePresetId, apiKey: preset.apiKey, endpoint: preset.endpoint, model: preset.model });
+}
 
 // Current form values (may not be saved yet)
 function formCfg() {
   return {
     apiKey: $('apiKey').value.trim(),
     endpoint: $('endpoint').value.trim() || DEFAULTS.endpoint,
-    model: $('model').value.trim() || DEFAULTS.model
+    model: $('model').value.trim()
   };
 }
 
@@ -56,12 +90,12 @@ async function timedFetch(url, init) {
 }
 
 function requireKey(cfg) {
-  if (!cfg.apiKey) throw new Error('未填写 API Key');
+  if (!cfg.apiKey && !isLocal(cfg.endpoint)) throw new Error('未填写 API Key');
 }
 
 async function listModels(cfg) {
   const r = await timedFetch(baseUrl(cfg.endpoint) + '/models', {
-    headers: { Authorization: 'Bearer ' + cfg.apiKey }
+    headers: authHeaders(cfg)
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}：${r.text.slice(0, 160)}`);
   let data;
@@ -72,9 +106,10 @@ async function listModels(cfg) {
 
 // One minimal chat request
 async function chatPing(cfg) {
+  if (!cfg.model) throw new Error('请先选择模型名');
   const r = await timedFetch(chatUrl(cfg.endpoint), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + cfg.apiKey },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(cfg) },
     body: JSON.stringify({
       model: cfg.model,
       messages: [{ role: 'user', content: 'Reply with OK.' }],
@@ -92,10 +127,14 @@ async function chatPing(cfg) {
 }
 
 (async () => {
-  const cfg = await chrome.storage.local.get(DEFAULTS);
-  $('apiKey').value = cfg.apiKey;
-  $('endpoint').value = cfg.endpoint;
-  $('model').value = cfg.model;
+  const cfg = await chrome.storage.local.get({ ...DEFAULTS, presets: [], activePresetId: '' });
+  presets = Array.isArray(cfg.presets) ? cfg.presets : [];
+  if (!presets.length) {
+    presets = [{ id: crypto.randomUUID(), name: '默认预设', apiKey: cfg.apiKey, endpoint: cfg.endpoint, model: cfg.model }];
+    await chrome.storage.local.set({ presets, activePresetId: presets[0].id });
+  }
+  const active = presets.find(p => p.id === cfg.activePresetId) || presets[0];
+  await activatePreset(active);
   $('status').textContent = `Word Hover 释义助手 ${chrome.runtime.getManifest().version}`;
   const sw = await chrome.storage.local.get({
     hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true,
@@ -126,12 +165,46 @@ $('hoverPhraseOnly').addEventListener('change', async () => {
 });
 
 $('save').addEventListener('click', async () => {
-  await chrome.storage.local.set({
-    apiKey: $('apiKey').value.trim(),
-    endpoint: $('endpoint').value.trim() || DEFAULTS.endpoint,
-    model: $('model').value.trim() || DEFAULTS.model
-  });
-  $('status').textContent = '设置已保存';
+  const values = formCfg();
+  if (!values.model) { $('status').textContent = '请先填写或获取模型名'; return; }
+  const preset = presets.find(p => p.id === activePresetId);
+  Object.assign(preset, values, { name: $('presetName').value.trim() || preset.name });
+  await chrome.storage.local.set({ presets });
+  await activatePreset(preset);
+  $('status').textContent = `已保存并启用「${preset.name}」`;
+});
+
+$('presetSelect').addEventListener('change', async () => {
+  const preset = presets.find(p => p.id === $('presetSelect').value);
+  if (!preset) return;
+  await activatePreset(preset);
+  $('status').textContent = `已切换到「${preset.name}」`;
+});
+
+$('newPreset').addEventListener('click', async () => {
+  const preset = { id: crypto.randomUUID(), name: `新预设 ${presets.length + 1}`, ...formCfg() };
+  presets.push(preset);
+  await chrome.storage.local.set({ presets });
+  await activatePreset(preset);
+  $('presetName').focus();
+  $('presetName').select();
+  $('status').textContent = '新预设已建立；修改名称和配置后点击“保存设置”';
+});
+
+$('ollamaPreset').addEventListener('click', async () => {
+  const preset = { id: crypto.randomUUID(), name: '本机 Ollama', apiKey: '', endpoint: 'http://localhost:11434/v1', model: '' };
+  presets.push(preset);
+  await chrome.storage.local.set({ presets });
+  await activatePreset(preset);
+  $('status').textContent = '已建立本机 Ollama 预设；获取模型后选择模型并保存';
+});
+
+$('deletePreset').addEventListener('click', async () => {
+  if (presets.length < 2) { $('status').textContent = '至少保留一个预设'; return; }
+  presets = presets.filter(p => p.id !== activePresetId);
+  await chrome.storage.local.set({ presets });
+  await activatePreset(presets[0]);
+  $('status').textContent = '预设已删除';
 });
 
 // 1) Fetch model list into the model-name suggestions
@@ -198,8 +271,10 @@ $('speedTest').addEventListener('click', () => busy(async () => {
 }));
 
 $('run').addEventListener('click', async () => {
-  const { apiKey } = await chrome.storage.local.get({ apiKey: '' });
-  if (!apiKey) {
+  const { apiKey, model } = await chrome.storage.local.get({ apiKey: '', model: '' });
+  const { endpoint } = await chrome.storage.local.get({ endpoint: DEFAULTS.endpoint });
+  if (!model) { $('status').textContent = '请先选择并保存模型名'; return; }
+  if (!apiKey && !isLocal(endpoint)) {
     $('status').textContent = '请先填写并保存 API Key';
     return;
   }
