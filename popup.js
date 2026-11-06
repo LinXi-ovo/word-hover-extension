@@ -155,7 +155,10 @@ const SWITCH_NAMES = {
 };
 Object.keys(SWITCH_NAMES).forEach(id => {
   $(id).addEventListener('change', async () => {
-    await chrome.storage.local.set({ [id]: $(id).checked });
+    const changes = { [id]: $(id).checked };
+    if ($(id).checked && id === 'dbgChunk') { changes.dbgSentence = false; $('dbgSentence').checked = false; }
+    if ($(id).checked && id === 'dbgSentence') { changes.dbgChunk = false; $('dbgChunk').checked = false; }
+    await chrome.storage.local.set(changes);
     $('status').textContent = `${SWITCH_NAMES[id]}已${$(id).checked ? '开启' : '关闭'}`;
   });
 });

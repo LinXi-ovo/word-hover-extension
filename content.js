@@ -18,6 +18,7 @@
   let chunkKey = ''; // Ctrl mode: word|context currently being shown
   let renderedChunkKey = '';
   let reqId = 0;
+  let activeMode = 'none';
   let modelEpoch = 0;
   let mx = 0, my = 0;
   let anchorRect = null;
@@ -375,6 +376,13 @@
     if (hasHL) CSS.highlights.delete('dsh-hover');
   }
 
+  function switchMode(mode) {
+    if (activeMode === mode) return;
+    hideTip();
+    reqId++; // prevent an old word/sentence response from repainting another mode
+    activeMode = mode;
+  }
+
   // Shift mode: show the Chinese translation of the sentence under the pointer
   function sentenceMode(x, y) {
     const s = sentenceAt(x, y);
@@ -534,13 +542,12 @@
   document.addEventListener('mousemove', e => {
     mx = e.clientX;
     my = e.clientY;
-    // Sentence meaning: holding Shift, or the debug switch "直接显示句意"
-    if (settings.shiftEnabled && (e.shiftKey || settings.dbgSentence)) { lastHover = null; sentenceMode(mx, my); return; }
-    sentKey = '';
-
-    // Constituent meaning: holding Ctrl, or the debug switch "直接显示成分"
-    if (settings.ctrlEnabled && (e.ctrlKey || settings.dbgChunk)) { lastHover = null; chunkMode(mx, my); return; }
-    chunkKey = '';
+    // Exactly one hover mode owns the tip and highlight at a time. Ctrl takes priority.
+    const mode = settings.ctrlEnabled && (e.ctrlKey || settings.dbgChunk) ? 'chunk'
+      : settings.shiftEnabled && (e.shiftKey || settings.dbgSentence) ? 'sentence' : 'word';
+    switchMode(mode);
+    if (mode === 'chunk') { chunkMode(mx, my); return; }
+    if (mode === 'sentence') { sentenceMode(mx, my); return; }
 
     if (!settings.hoverEnabled) { hideTip(); return; }
 
@@ -636,11 +643,12 @@
 
   // Pressing Shift switches to sentence mode immediately; releasing returns to word mode
   document.addEventListener('keydown', e => {
-    if (e.key === 'Shift' && !e.repeat && settings.shiftEnabled) sentenceMode(mx, my);
-    if (e.key === 'Control' && !e.repeat && settings.ctrlEnabled) chunkMode(mx, my);
+    if (e.repeat) return;
+    if (e.key === 'Control' && settings.ctrlEnabled) { switchMode('chunk'); chunkMode(mx, my); }
+    else if (e.key === 'Shift' && settings.shiftEnabled && activeMode !== 'chunk') { switchMode('sentence'); sentenceMode(mx, my); }
   });
   document.addEventListener('keyup', e => {
-    if (e.key === 'Shift' || e.key === 'Control') hideTip();
+    if (e.key === 'Shift' || e.key === 'Control') switchMode('none');
   });
   window.addEventListener('blur', hideTip);
 
