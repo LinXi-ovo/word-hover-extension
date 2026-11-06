@@ -16,6 +16,9 @@
   #diag.ok { color: #047857; }
   #diag.err { color: #b91c1c; }
   button:disabled { opacity: .55; cursor: wait; }
+  .toggles { margin-top: 12px; border-top: 1px solid #e5e7eb; padding-top: 8px; }
+  .switch { display: flex; align-items: center; gap: 8px; margin-top: 6px; color: #1f2937; font-size: 13px; cursor: pointer; }
+  .switch input { width: auto; margin: 0; }
 </style>
 </head>
 <body>
@@ -38,6 +41,10 @@
   <div class="row">
     <button id="save" class="secondary">保存设置</button>
     <button id="run">分析本页</button>
+  </div>
+  <div class="toggles">
+    <label class="switch"><input id="hoverEnabled" type="checkbox"> 单词 / 词组悬浮释义</label>
+    <label class="switch"><input id="shiftEnabled" type="checkbox"> 按住 Shift 查看句意</label>
   </div>
   <div id="status"></div>
   <div id="diag"></div>

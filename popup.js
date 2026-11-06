@@ -97,7 +97,18 @@ async function chatPing(cfg) {
   $('endpoint').value = cfg.endpoint;
   $('model').value = cfg.model;
   $('status').textContent = `Word Hover 释义助手 ${chrome.runtime.getManifest().version}`;
+  const sw = await chrome.storage.local.get({ hoverEnabled: true, shiftEnabled: true });
+  $('hoverEnabled').checked = sw.hoverEnabled;
+  $('shiftEnabled').checked = sw.shiftEnabled;
 })();
+
+// Feature switches save immediately; content scripts pick them up through storage.onChanged
+['hoverEnabled', 'shiftEnabled'].forEach(id => {
+  $(id).addEventListener('change', async () => {
+    await chrome.storage.local.set({ [id]: $(id).checked });
+    $('status').textContent = `${id === 'hoverEnabled' ? '单词悬浮' : 'Shift 句意'}已${$(id).checked ? '开启' : '关闭'}`;
+  });
+});
 
 $('save').addEventListener('click', async () => {
   await chrome.storage.local.set({

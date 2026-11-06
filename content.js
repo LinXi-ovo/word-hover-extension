@@ -17,6 +17,16 @@
   let reqId = 0;
   let mx = 0, my = 0;
 
+  // User switches (popup). Both default to on; changes apply live via storage.onChanged.
+  const settings = { hoverEnabled: true, shiftEnabled: true };
+  chrome.storage.local.get({ hoverEnabled: true, shiftEnabled: true }).then(s => Object.assign(settings, s));
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if ('hoverEnabled' in changes) settings.hoverEnabled = !!changes.hoverEnabled.newValue;
+    if ('shiftEnabled' in changes) settings.shiftEnabled = !!changes.shiftEnabled.newValue;
+    if (!settings.hoverEnabled || !settings.shiftEnabled) hideTip();
+  });
+
   const tip = document.createElement('div');
   tip.id = 'dsh-tip';
   const toast = document.createElement('div');
@@ -324,9 +334,11 @@
     mx = e.clientX;
     my = e.clientY;
 
-    // Hold Shift: sentence meaning mode
-    if (e.shiftKey) { sentenceMode(mx, my); return; }
+    // Hold Shift: sentence meaning mode (if enabled); otherwise fall through to word hover
+    if (e.shiftKey && settings.shiftEnabled) { sentenceMode(mx, my); return; }
     sentKey = '';
+
+    if (!settings.hoverEnabled) { hideTip(); return; }
 
     const term = phraseAt(mx, my);
     if (term) {
@@ -369,7 +381,7 @@
 
   // Pressing Shift switches to sentence mode immediately; releasing returns to word mode
   document.addEventListener('keydown', e => {
-    if (e.key === 'Shift' && !e.repeat) sentenceMode(mx, my);
+    if (e.key === 'Shift' && !e.repeat && settings.shiftEnabled) sentenceMode(mx, my);
   });
   document.addEventListener('keyup', e => {
     if (e.key === 'Shift') hideTip();

@@ -52,6 +52,8 @@ function log(...a) { console.log(...a); }
   // 2) Popup: fill form and run the three tools
   const pop = await context.newPage();
   await pop.goto(`chrome-extension://${extId}/popup.html`);
+  // Wait for the popup's own init (it loads saved values) so it cannot overwrite what we fill in
+  await pop.waitForFunction(() => /0\.1\.\d/.test(document.getElementById('status').textContent));
   await pop.fill('#apiKey', KEY);
   await pop.fill('#endpoint', EP);
   await pop.fill('#model', MODEL);
@@ -104,7 +106,7 @@ function log(...a) { console.log(...a); }
   await page.waitForFunction(() => getComputedStyle(document.getElementById('dsh-tip')).display === 'block', null, { timeout: 30000 });
   await page.waitForTimeout(4000);
   const wordTip = (await page.textContent('#dsh-tip')).trim();
-  const r5 = !/失败|查询中/.test(wordTip);
+  const r5 = !/失败|查询中|错误|未设置/.test(wordTip) && wordTip.length > 'interconnected'.length;
   log(`[${r5 ? 'PASS' : 'FAIL'}] 单词悬停 "interconnected": ${wordTip}`);
 
   // 5) Shift sentence mode over paragraph 2 (sentence crosses an <a> tag)
@@ -118,13 +120,40 @@ function log(...a) { console.log(...a); }
   await page.waitForFunction(() => /句意/.test(document.getElementById('dsh-tip')?.textContent || '') && !/翻译中/.test(document.getElementById('dsh-tip')?.textContent || ''), null, { timeout: 60000 }).catch(() => {});
   const sentTip = (await page.textContent('#dsh-tip')).trim();
   await page.keyboard.up('Shift');
-  const r6 = /句意/.test(sentTip) && !/失败|错误/.test(sentTip);
+  const r6 = /句意/.test(sentTip) && !/失败|错误|未设置/.test(sentTip) && !/翻译中/.test(sentTip);
   log(`[${r6 ? 'PASS' : 'FAIL'}] Shift 句意: ${sentTip}`);
+
+  // 6) Switch off word hover in the popup: hovering a word must no longer show a tip
+  await pop.bringToFront();
+  await pop.uncheck('#hoverEnabled');
+  await pop.waitForTimeout(300);
+  await page.bringToFront();
+  await page.mouse.move(box.x - 30, box.y - 30);
+  await page.mouse.move(box.x, box.y);
+  await page.waitForTimeout(1500);
+  const hiddenWhenOff = await page.evaluate(() => getComputedStyle(document.getElementById('dsh-tip')).display === 'none');
+  log(`[${hiddenWhenOff ? 'PASS' : 'FAIL'}] 关闭单词悬浮后不显示提示`);
+
+  // 7) Word hover back on, Shift sentence mode off: holding Shift must no longer show 句意
+  await pop.bringToFront();
+  await pop.check('#hoverEnabled');
+  await pop.uncheck('#shiftEnabled');
+  await pop.waitForTimeout(300);
+  await page.bringToFront();
+  await page.mouse.move(sb.x, sb.y);
+  await page.keyboard.down('Shift');
+  await page.mouse.move(sb.x + 2, sb.y);
+  await page.waitForTimeout(1500);
+  const shiftTip = (await page.textContent('#dsh-tip')).trim();
+  await page.keyboard.up('Shift');
+  const hiddenShiftOff = !/句意/.test(shiftTip);
+  log(`[${hiddenShiftOff ? 'PASS' : 'FAIL'}] 关闭 Shift 句意后不显示句意`);
+  const r7 = hiddenWhenOff && hiddenShiftOff;
 
   await context.close();
   server.close();
   fs.rmSync(userDataDir, { recursive: true, force: true });
-  const all = [r1, r2, r3, r4, r5, r6];
+  const all = [r1, r2, r3, r4, r5, r6, r7];
   log(`\nSUMMARY: ${all.filter(Boolean).length}/${all.length} passed`);
   process.exit(all.every(Boolean) ? 0 : 1);
 })().catch(err => { console.error('E2E ERROR:', err.message); process.exit(2); });
