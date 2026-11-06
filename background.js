@@ -8,12 +8,113 @@ function hashKey(s) {
   return (x >>> 0).toString(36);
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+// ---------- cache: lifetime grows with how many times the AI confirmed the same value ----------
+// Entry: { v: value, count: times the AI returned this same value, at: last AI confirmation time }.
+// One confirmation lives 12 h; each extra confirmation doubles that, capped at 60 days.
+// A different answer from the AI replaces the value and resets count to 1.
+const HOUR = 3600000;
+function cacheLife(count) {
+  return Math.min(60 * 24 * HOUR, 12 * HOUR * 2 ** Math.min(Math.max(count, 1) - 1, 8));
+}
+function isFresh(entry) {
+  return !!entry && typeof entry === 'object' && 'v' in entry && Date.now() - entry.at <= cacheLife(entry.count);
+}
+async function cacheGetRaw(key) {
+  return (await chrome.storage.local.get(key))[key] || null;
+}
+async function cacheSave(key, value, prev) {
+  const same = !!prev && typeof prev === 'object' && 'v' in prev && JSON.stringify(prev.v) === JSON.stringify(value);
+  await chrome.storage.local.set({ [key]: { v: value, count: same ? prev.count + 1 : 1, at: Date.now() } });
+}
+
+// ---------- retry queue: jobs that still hit a provider limit are retried later and pushed back to the tab ----------
+const MAX_RETRY = 6;
+const MAX_QUEUE = 200;
+let queuedJobs = 0;
+
+function isLimited(err) {
+  return /tier_limit_exceeded|concurrency limit|rate.?limit|\b429\b|返回空内容|没有 choices|finish_reason=undefined/i.test(String(err && err.message));
+}
+
+async function runKind(kind, payload, tries) {
+  if (kind === 'lookup') return lookupCore(payload, tries);
+  if (kind === 'sentence') return sentenceCore(payload, tries);
+  if (kind === 'segment') return segmentCore(payload, tries);
+  throw new Error('未知任务类型 ' + kind);
+}
+
+// Run now; if a limit error still happens and the request came from a tab, queue it for later retry
+async function dispatch(kind, payload, sender) {
+  try {
+    return await runKind(kind, payload, 2);
+  } catch (err) {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+    if (!isLimited(err) || tabId == null) throw err;
+    if (queuedJobs >= MAX_QUEUE) throw new Error('重试队列已满，请稍后再试');
+    const job = { id: 'j' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), kind, payload, tabId, attempts: 0 };
+    queuedJobs++;
+    scheduleRetry(job);
+    return { queued: true, id: job.id };
+  }
+}
+
+function scheduleRetry(job) {
+  job.attempts++;
+  const delay = Math.min(120000, 3000 * 2 ** (job.attempts - 1)); // 3s, 6s, 12s, 24s, 48s, 96s
+  setTimeout(async () => {
+    try {
+      const data = await runKind(job.kind, job.payload, 1);
+      finishJob(job, { ok: true, data });
+    } catch (err) {
+      if (isLimited(err) && job.attempts < MAX_RETRY) scheduleRetry(job);
+      else finishJob(job, { ok: false, error: err.message });
+    }
+  }, delay);
+}
+
+function finishJob(job, body) {
+  queuedJobs--;
+  chrome.tabs.sendMessage(job.tabId, { type: 'result', id: job.id, ...body }).catch(() => {});
+}
+
+// Whole-article segmentation: runs in the background after the tab gets an immediate "queued" reply, and the
+// final counts are pushed back as a 'result' message. Each sentence goes through segmentCore, so its result
+// is cached per sentence; later Ctrl hovers read the cache. Failed sentences are simply left for a later hover.
+async function segmentDocJob(sentences, job) {
+  let done = 0;
+  const total = sentences.length;
+  let next = 0;
+  const worker = async () => {
+    while (next < total) {
+      const s = sentences[next++];
+      try {
+        await segmentCore({ sentence: s, force: !!job.force }, 2);
+        done++;
+      } catch (_) { /* leave it; hover will retry this sentence */ }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT, total) }, worker));
+  return { done, total };
+}
+
+function startSegmentDoc(msg, sender) {
+  const sentences = (Array.isArray(msg.sentences) ? msg.sentences : []).map(s => String(s || '').trim()).filter(Boolean);
+  const tabId = sender && sender.tab ? sender.tab.id : null;
+  if (!sentences.length) return Promise.resolve({ done: 0, total: 0 });
+  if (tabId == null) return Promise.reject(new Error('缺少标签页信息'));
+  const job = { id: 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), tabId, force: !!msg.force };
+  segmentDocJob(sentences, job).then(data => finishJob(job, { ok: true, data }))
+    .catch(err => finishJob(job, { ok: false, error: err.message }));
+  return Promise.resolve({ queued: true, id: job.id });
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   let task = null;
-  if (msg.type === 'lookup') task = lookup(msg);
-  if (msg.type === 'annotate') task = annotate(msg);
-  if (msg.type === 'sentence') task = sentence(msg);
-  if (msg.type === 'chunk') task = chunk(msg);
+  if (msg.type === 'lookup') task = dispatch('lookup', msg, sender);
+  if (msg.type === 'annotate') task = annotateCached(msg);
+  if (msg.type === 'sentence') task = dispatch('sentence', msg, sender);
+  if (msg.type === 'segment') task = dispatch('segment', msg, sender);
+  if (msg.type === 'segmentDoc') task = startSegmentDoc(msg, sender);
   // Settings-page tools: they use the form values passed in msg.cfg (not yet saved)
   if (msg.type === 'listModels') task = listModels(msg);
   if (msg.type === 'testConnection') task = testConnection(msg);
@@ -58,26 +159,20 @@ function release() {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function callJSON(prompt, maxTokens = 4096, system = SYS_DEFAULT) {
-  await acquire();
-  try {
-    return await callJSONOnce(prompt, maxTokens, system);
-  } finally {
-    release();
-  }
-}
-
-// Retry on rate/concurrency limits with growing backoff; other errors are raised at once
-async function callJSONOnce(prompt, maxTokens, system) {
+// Retry limit errors a few times inline (releasing the concurrency slot while backing off);
+// longer waits are handled by the retry queue in dispatch()
+// tries: inline attempts. Hover requests use 2; queued retries use 1 so one job does not multiply into many calls.
+async function callJSON(prompt, maxTokens = 4096, system = SYS_DEFAULT, tries = 2) {
   for (let attempt = 1; ; attempt++) {
+    await acquire();
     try {
       return await requestJSON(prompt, maxTokens, system);
     } catch (err) {
-      // Also retry an empty reply: some providers answer 200 without choices under load
-      const limited = /tier_limit_exceeded|concurrency limit|rate.?limit|\b429\b|返回空内容|没有 choices|finish_reason=undefined/i.test(err.message);
-      if (!limited || attempt >= 4) throw err;
-      await sleep(1000 * attempt * attempt); // 1s, 4s, 9s
+      if (!isLimited(err) || attempt >= tries) throw err;
+    } finally {
+      release();
     }
+    await sleep(1000 * attempt * attempt); // 1s, 4s, 9s
   }
 }
 
@@ -108,19 +203,20 @@ async function requestJSON(prompt, maxTokens, system) {
 
 // Single word lookup in its context. The cache is keyed by word AND context, so the same word
 // in another sentence gets its own meaning. force=true skips the cache (middle-click refresh).
-async function lookup({ word, context, force }) {
-  const key = 'w:' + word.toLowerCase() + '|' + hashKey(context || '');
-  if (!force) {
-    const cached = (await chrome.storage.local.get(key))[key];
-    if (cached) return { zh: cached };
-  }
+// Keyed by word + the sentence it appears in, so one page reuses the answer for the same word in the same sentence.
+// force=true (middle-click refresh) asks the AI again; the cache is then updated by cacheSave().
+async function lookupCore({ word, sentence: sent0, context, force }, tries = 2) {
+  const sent = String(sent0 || context || '');
+  const key = 'w2:' + word.toLowerCase() + '|' + hashKey(sent);
+  const prev = await cacheGetRaw(key);
+  if (!force && isFresh(prev)) return { zh: prev.v };
   const out = await callJSON(
     `Give a concise Chinese meaning (at most 15 Chinese characters) of the English word "${word}" ` +
-    `as it is used in the sentence that contains it, in this text: """${context}""". Return JSON {"zh": "..."}.`,
-    4096, SYS_WORD
+    `as it is used in the sentence that contains it, in this text: """${context || sent}""". Return JSON {"zh": "..."}.`,
+    4096, SYS_WORD, tries
   );
   const zh = String(out.zh || '').trim() || '暂无释义';
-  await chrome.storage.local.set({ [key]: zh });
+  await cacheSave(key, zh, prev);
   return { zh };
 }
 
@@ -208,103 +304,74 @@ async function pingOnce(msg) {
 }
 
 // Translate one sentence into natural Chinese, cached in chrome.storage.local
-async function sentence({ text }) {
-  const key = 's:' + text;
-  const cached = (await chrome.storage.local.get(key))[key];
-  if (cached) return { zh: cached };
+async function sentenceCore({ text }, tries = 2) {
+  const key = 's2:' + String(text).length + '.' + hashKey(text);
+  const prev = await cacheGetRaw(key);
+  if (isFresh(prev)) return { zh: prev.v };
   const out = await callJSON(
     'Translate the English sentence below into natural, accurate Chinese. ' +
     'Return JSON {"zh": "..."}.\n\nSENTENCE:\n"""' + text + '"""',
-    4096, SYS_SENT
+    4096, SYS_SENT, tries
   );
   const zh = String(out.zh || '').trim() || '暂无译文';
-  await chrome.storage.local.set({ [key]: zh });
+  await cacheSave(key, zh, prev);
   return { zh };
 }
 
-// Regex that matches the word as a whole word (case-insensitive)
-function wordPattern(word) {
-  return new RegExp('(^|[^A-Za-z])' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z]|$)', 'i');
-}
+// ---------- Ctrl mode: constituent segmentation ----------
+// The whole sentence is split ONCE into consecutive constituents (units larger than a phrase, smaller than the
+// sentence), each with an overall Chinese gloss. Any word inside a constituent then shows that constituent's meaning.
+const SYS_SEG = 'You are an English grammar analyst. You split sentences into consecutive grammatical constituents and give the meaning of each constituent as a whole. Reply with one JSON object.';
 
-// The sentence in the paragraph that contains the word; used when the page did not pass the hovered sentence
-function sentenceOf(context, word) {
-  const re = wordPattern(word);
-  const sentences = String(context).split(/(?<=[.!?])\s+/);
-  return sentences.find(s => re.test(s)) || String(context);
-}
+async function segmentCore({ sentence: sent }, tries = 2) {
+  const text = String(sent || '').trim();
+  if (!text) throw new Error('句子为空');
+  const key = 'seg2:' + text.length + '.' + hashKey(text);
+  const prev = await cacheGetRaw(key);
+  if (isFresh(prev)) return { segments: prev.v };
 
-// Ctrl mode: a constituent that contains the word, inside the hovered sentence.
-// A constituent is a grammatical unit longer than a phrase and shorter than the sentence, e.g.
-//   - a noun phrase with long modifiers ("the prompt diagnosis, investigation and follow-up of cases")
-//   - coordinated words/phrases/clauses ("A, B and C", "X or Y")
-//   - a subordinate clause ("which led to ...", "that occur within ...")
-//   - a prepositional or with-phrase used as an adverbial ("with strong political commitment")
-//   - a verb phrase with its object or complement
-// Step 1 asks for the constituent directly; step 2 lists the sentence's constituents and picks one by local rules.
-// Only a valid constituent is cached; a miss is returned uncached so it can be retried.
-const CHUNK_MIN_WORDS = 2;
-const CHUNK_MAX_WORDS = 30;
-const CONSTITUENT_TYPES =
-  'a noun phrase with its modifiers (possibly long, e.g. with several attributive words or an "of" phrase), ' +
-  'coordinated words, phrases or clauses joined by and/or/but, a subordinate clause (that/which/when/if/because ...), ' +
-  'a prepositional or with-phrase used as an adverbial, a verb phrase with its object or complement, or a phrasal verb or fixed collocation';
-
-async function chunk({ word, context, sentence }) {
-  const sent = sentence || sentenceOf(context, word);
-  const key = 'c3:' + word.toLowerCase() + '|' + hashKey(sent);
-  const cached = (await chrome.storage.local.get(key))[key];
-  if (cached) return cached;
-
-  const wordRe = wordPattern(word);
-  const wordCount = c => c.split(/\s+/).filter(Boolean).length;
-  const norm = s => s.replace(/[.!?;:,。！？；：]+$/, '').trim();
-  // Valid: copied from the sentence, contains the target word, has a sensible size, and is not the whole sentence
-  const valid = c => {
-    const n = wordCount(c);
-    return n >= CHUNK_MIN_WORDS && n <= CHUNK_MAX_WORDS && wordRe.test(c) &&
-      sent.includes(c) && norm(c) !== norm(sent);
-  };
-
-  // Step 1: the constituent containing the word
-  let found = null;
-  const direct = await callJSON(
-    `Sentence: """${sent}"""\nTarget word: "${word}"\n` +
-    `Find the smallest complete constituent that contains the target word and is a single grammatical unit. ` +
-    `It may be ${CONSTITUENT_TYPES}. ` +
-    'It must be copied verbatim from the sentence, contain the target word, be longer than a two-word phrase where the grammar allows, ' +
-    'and must NOT be the whole sentence or a whole main clause. ' +
-    'Give "zh" as a short Chinese gloss of the whole unit in this sentence, at most 25 Chinese characters, no grammar analysis. ' +
-    'Return JSON {"chunk":"...","zh":"..."}.',
-    2048, SYS_CHUNK
-  );
-  const dc = String(direct.chunk || '').trim();
-  if (valid(dc)) found = { chunk: dc, zh: String(direct.zh || '').trim() || '暂无释义' };
-
-  // Step 2 (fallback): list the sentence's constituents and pick the one by local rules
-  if (!found) {
+  let segs = null;
+  for (let attempt = 1; attempt <= 2 && !segs; attempt++) {
     const out = await callJSON(
-      `List the grammatical constituents in the sentence below. Each one is ${CONSTITUENT_TYPES}. ` +
-      'Each must be copied verbatim from the sentence, be longer than a single word, and must not be the whole sentence. ' +
-      'Give "zh" for each as a short Chinese gloss of the whole unit, at most 25 Chinese characters, no grammar analysis. ' +
-      'Return JSON {"units":[{"text":"...","zh":"..."}]}.\n\nSENTENCE:\n"""' + sent + '"""',
-      4096, SYS_CHUNK
+      'Split the sentence below into consecutive constituents that together cover every word, in order, without overlap. ' +
+      'A constituent is a grammatical unit larger than a phrase and smaller than the sentence, for example: ' +
+      'a noun phrase with its modifiers (even a long one), a coordinated structure (A, B and C), a subordinate clause, ' +
+      'a prepositional or with-phrase used as an adverbial, or a verb phrase with its object or complement. ' +
+      'Each "text" must be copied exactly from the sentence. ' +
+      'Each "zh" is a short Chinese gloss of the whole unit in this sentence, at most 25 Chinese characters. ' +
+      'Return JSON {"units":[{"text":"...","zh":"..."}]}.\n\nSENTENCE:\n"""' + text + '"""',
+      8192, SYS_SEG, tries
     );
-    const units = (Array.isArray(out.units) ? out.units : [])
-      .map(u => ({ text: String((u && u.text) || '').trim(), zh: String((u && u.zh) || '').trim() }))
-      .filter(u => u.text && u.zh && valid(u.text))
-      // Prefer the smallest constituent of at least three words (a real constituent, not a stray pair);
-      // fall back to a two-word unit only if nothing longer contains the word
-      .sort((a, b) => {
-        const ka = wordCount(a.text) >= 3 ? 0 : 1, kb = wordCount(b.text) >= 3 ? 0 : 1;
-        return ka - kb || wordCount(a.text) - wordCount(b.text);
-      });
-    if (units.length) found = { chunk: units[0].text, zh: units[0].zh };
+    segs = alignSegments(text, out.units);
   }
+  if (!segs) throw new Error('成分切分失败：模型结果无法对齐到原句');
+  await cacheSave(key, segs, prev);
+  return { segments: segs };
+}
 
-  if (!found) return { chunk: word, zh: '未找到成分' };
-  await chrome.storage.local.set({ [key]: found });
-  return found;
+// Map the model's units onto the sentence in order. Segments tile the sentence: each one runs from the previous
+// segment's end to its own end, so words the model skipped are absorbed by the next unit and no word is left out.
+// Units that are not verbatim or out of order are skipped.
+function alignSegments(sent, units) {
+  if (!Array.isArray(units)) return null;
+  const segs = [];
+  let cursor = 0;
+  for (const u of units) {
+    const t = String((u && u.text) || '').trim();
+    if (!t) continue;
+    const idx = sent.indexOf(t, cursor);
+    if (idx < 0) continue;
+    const end = idx + t.length;
+    segs.push({ start: cursor, end, zh: String((u && u.zh) || '').trim() || '暂无释义' });
+    cursor = end;
+  }
+  if (!segs.length) return null;
+  segs[segs.length - 1].end = sent.length; // the tail after the last unit belongs to it
+  segs.forEach(s => {
+    while (s.start < s.end && /\s/.test(sent[s.start])) s.start++;
+    s.text = sent.slice(s.start, s.end).trim();
+  });
+  return segs.filter(s => s.text);
 }
 
 // Pick learnable words/phrases in a chunk of page text
@@ -320,4 +387,15 @@ async function annotate({ text }) {
     ? out.items.filter(i => i && typeof i.text === 'string' && typeof i.zh === 'string')
     : [];
   return { items };
+}
+
+// Article annotations are also reusable after a reload. Key by the exact chunk text.
+async function annotateCached({ text }) {
+  const source = String(text || '');
+  const key = 'a1:' + source.length + '.' + hashKey(source);
+  const prev = await cacheGetRaw(key);
+  if (isFresh(prev)) return { items: prev.v };
+  const result = await annotate({ text: source });
+  await cacheSave(key, result.items, prev);
+  return result;
 }

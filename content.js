@@ -15,9 +15,9 @@
   let lastKey = '';
   let sentKey = '';
   let chunkKey = ''; // Ctrl mode: word|context currently being shown
-  const chunkCache = new Map(); // word|context -> {chunk, zh}, for this page only
   let reqId = 0;
   let mx = 0, my = 0;
+  let anchorRect = null;
 
   // User switches (popup). Both default to on; changes apply live via storage.onChanged.
   // dbgSentence / dbgChunk: show sentence meaning / constituent on hover without holding Shift / Ctrl (debug).
@@ -45,10 +45,13 @@
   const hasHL = typeof CSS !== 'undefined' && !!CSS.highlights && typeof Highlight !== 'undefined';
 
   // ---------- helpers ----------
+  // A newer message cancels the auto-hide of an older one, so phase-2 status is not hidden by phase-1 timers
+  let toastTimer = null;
   function showToast(msg, ms = 0) {
     toast.textContent = msg;
     toast.style.display = 'block';
-    if (ms) setTimeout(() => { toast.style.display = 'none'; }, ms);
+    clearTimeout(toastTimer);
+    if (ms) toastTimer = setTimeout(() => { toast.style.display = 'none'; }, ms);
   }
 
   function isInsideOurUI(el) {
@@ -96,7 +99,7 @@
     return false;
   }
 
-  async function analyze() {
+  async function analyze(force = false) {
     const nodes = textNodes().filter(n => /[A-Za-z]{3,}/.test(n.nodeValue));
     const chunks = [];
     let cur = '';
@@ -112,7 +115,7 @@
     let marked = 0;
     for (let i = 0; i < todo.length; i++) {
       showToast(`分析中 ${i + 1}/${todo.length}…`);
-      const res = await chrome.runtime.sendMessage({ type: 'annotate', text: todo[i] });
+      const res = await chrome.runtime.sendMessage({ type: 'annotate', text: todo[i], force });
       if (!res || res.error) {
         showToast('分析失败：' + (res && res.error ? res.error : '无响应'), 6000);
         return;
@@ -123,7 +126,53 @@
       }
     }
     const note = chunks.length > MAX_CHUNKS ? `（仅分析前 ${MAX_CHUNKS} 段）` : '';
-    showToast(`完成：已标注 ${marked} 个词条${note}。悬停任意单词查看释义。`, 6000);
+    // Phase 1 is done and rendered. Phase 2 (constituents for the whole article) runs after it.
+    segmentArticle(`已标注 ${marked} 个词条${note}。悬停任意单词查看释义。`, force);
+  }
+
+  // Sentences of the page, split the same way sentenceAt() splits them, so cache keys line up with Ctrl lookups
+  function collectSentences() {
+    const groups = new Map(); // block element -> its text nodes, in order
+    for (const n of textNodes()) {
+      const b = blockOf(n);
+      if (!groups.has(b)) groups.set(b, []);
+      groups.get(b).push(n);
+    }
+    const seen = new Set();
+    const out = [];
+    const push = (full, a, b) => {
+      let s = full.slice(a, b);
+      s = s.replace(/^\s+/, '').replace(/\s+$/, '');
+      if (s.length < 3 || !/[A-Za-z]{2,}/.test(s) || seen.has(s)) return;
+      seen.add(s);
+      out.push(s.slice(0, 1200));
+    };
+    for (const nodes of groups.values()) {
+      let full = '';
+      for (const n of nodes) full += n.nodeValue;
+      let a = 0;
+      for (let i = 0; i < full.length; i++) {
+        const be = boundaryEnd(full, i);
+        if (be >= 0) { push(full, a, be); a = be; }
+      }
+      push(full, a, full.length);
+    }
+    return out;
+  }
+
+  // Phase 2: send the article's sentences to the background once; it splits them into constituents and caches
+  // each sentence, so Ctrl hovering needs no per-sentence request afterwards.
+  const MAX_DOC_SENTENCES = 240;
+  // prefix: phase-1 result, kept on screen together with the phase-2 status
+  function segmentArticle(prefix = '', force = false) {
+    const sents = collectSentences().slice(0, MAX_DOC_SENTENCES);
+    if (!sents.length) { showToast(prefix, 8000); return; }
+    showToast(`${prefix}成分分析中（${sents.length} 句，后台进行）…`);
+    askBg({ type: 'segmentDoc', sentences: sents, force }, res => {
+      if (res.error) { showToast(`${prefix}成分分析失败：${res.error}`, 8000); return; }
+      const miss = res.total - res.done;
+      showToast(`${prefix}成分已就绪：${res.done}/${res.total} 句${miss ? `（${miss} 句未成功，悬停时会单独重试）` : ''}。按住 Ctrl 悬停查看。`, 8000);
+    });
   }
 
   // ---------- hover ----------
@@ -272,10 +321,11 @@
   function place() {
     const pad = 14;
     const r = tip.getBoundingClientRect();
-    let left = mx + pad;
-    let top = my + pad + 4;
+    const a = anchorRect || { right: mx, bottom: my, left: mx, top: my };
+    let left = a.right + pad;
+    let top = a.bottom + 4;
     if (left + r.width > innerWidth - 8) left = innerWidth - r.width - 8;
-    if (top + r.height > innerHeight - 8) top = my - r.height - pad;
+    if (top + r.height > innerHeight - 8) top = a.top - r.height - pad;
     tip.style.left = Math.max(8, left) + 'px';
     tip.style.top = Math.max(8, top) + 'px';
   }
@@ -316,14 +366,10 @@
     showTip('句意', '翻译中…', false);
     const id = ++reqId;
     try {
-      chrome.runtime.sendMessage({ type: 'sentence', text: key }, res => {
+      askBg({ type: 'sentence', text: key }, res => {
         if (id !== reqId || sentKey !== key) return; // stale response
-        if (chrome.runtime.lastError) {
+        if (res.error) {
           // Usually: the extension was reloaded and this page needs a refresh
-          showTip('句意', '失败：' + chrome.runtime.lastError.message, false);
-        } else if (!res) {
-          showTip('句意', '失败：后台无响应', false);
-        } else if (res.error) {
           showTip('句意', '失败：' + res.error, false);
         } else {
           sentCache.set(key, res.zh);
@@ -337,18 +383,25 @@
   }
 
   // Ctrl mode: meaning of the phrase/collocation containing the word under the pointer
-  // Range for `chunk` inside the text node, choosing the occurrence that covers the word start
-  function chunkRange(node, chunk, wStart) {
-    const text = node.nodeValue;
-    for (let i = text.indexOf(chunk); i >= 0; i = text.indexOf(chunk, i + 1)) {
-      if (i <= wStart && wStart < i + chunk.length) {
-        const r = document.createRange();
-        r.setStart(node, i);
-        r.setEnd(node, i + chunk.length);
-        return r;
-      }
+  // DOM range for character offsets [from, to) of a base range's text (offsets count like Range.toString())
+  function rangeFromOffsets(base, from, to) {
+    if (!base.startContainer || base.startContainer.nodeType !== Node.TEXT_NODE) return null;
+    const walker = document.createTreeWalker(base.commonAncestorContainer, NodeFilter.SHOW_TEXT);
+    walker.currentNode = base.startContainer;
+    let pos = 0, node = base.startContainer, sNode = null, sOff = 0, eNode = null, eOff = 0;
+    while (node) {
+      const from0 = node === base.startContainer ? base.startOffset : 0;
+      const len = node.nodeValue.length - from0;
+      if (!sNode && from < pos + len) { sNode = node; sOff = from0 + (from - pos); }
+      if (sNode && to <= pos + len) { eNode = node; eOff = from0 + (to - pos); break; }
+      pos += len;
+      node = walker.nextNode();
     }
-    return null;
+    if (!sNode || !eNode) return null;
+    const r = document.createRange();
+    r.setStart(sNode, sOff);
+    r.setEnd(eNode, eOff);
+    return r;
   }
 
   // Whole paragraph text around the word. Analysis wraps phrases in <span>, which splits text nodes,
@@ -357,52 +410,95 @@
     return blockOf(node).textContent.replace(/\s+/g, ' ').trim().slice(0, 800);
   }
 
-  function chunkMode(x, y) {
-    const w = wordAt(x, y);
-    if (!w) { hideTip(); return; }
-    w.context = paragraphContext(w.range.startContainer);
-    const key = w.word.toLowerCase() + '|' + w.context;
+  // The sentence the word belongs to (the same split as Shift/Ctrl). Falls back to the paragraph text.
+  function sentenceOfWord(w, x, y) {
+    const s = sentenceAt(x, y);
+    return s ? s.text : paragraphContext(w.range.startContainer);
+  }
 
-    // Highlight the chunk if it is found around the word; otherwise just the word
-    const apply = res => {
-      // The title is the model's unit whenever it contains the word; the highlight may fall back to the word
-      // (the page text can be split by existing annotations, so the unit is not always in one text node)
-      const unitOk = res.chunk.toLowerCase().includes(w.word.toLowerCase());
-      const r = unitOk ? chunkRange(w.range.startContainer, res.chunk, w.range.startOffset) : null;
+  // Ctrl mode: split the hovered sentence into constituents (one request per sentence, cached), then show the
+  // meaning of the constituent that contains the word under the pointer. Every word in a constituent shares it.
+  const segCache = new Map(); // sentence -> segments (page-level), or 'pending' promise
+  function chunkMode(x, y) {
+    const s = sentenceAt(x, y);
+    const w = wordAt(x, y);
+    if (!s || !w) { chunkKey = ''; hideTip(); return; }
+
+    // Offset of the word inside the sentence text (both measured in raw DOM text)
+    const pre = document.createRange();
+    pre.setStart(s.range.startContainer, s.range.startOffset);
+    pre.setEnd(w.range.startContainer, w.range.startOffset);
+    const wordOffset = pre.toString().length;
+    if (wordOffset < 0 || wordOffset >= s.text.length) { hideTip(); return; }
+
+    const key = s.text;
+    chunkKey = key + '#' + wordOffset;
+
+    const show = segments => {
+      const seg = segments.find(g => wordOffset >= g.start && wordOffset < g.end);
+      if (!seg) { showTip(w.word, '未找到所在成分', false); return; }
+      const r = rangeFromOffsets(s.range, seg.start, seg.end);
       setHL(r || w.range);
-      showTip(unitOk ? res.chunk : w.word, res.zh, true);
+      showTip(seg.text.length > 60 ? seg.text.slice(0, 60) + '…' : seg.text, seg.zh, true);
     };
 
-    if (key === chunkKey) {
-      if (chunkCache.has(key)) apply(chunkCache.get(key)); // in flight otherwise: keep waiting
+    if (segCache.has(key) && Array.isArray(segCache.get(key))) {
+      show(segCache.get(key));
       return;
     }
-    chunkKey = key;
-    if (chunkCache.has(key)) { apply(chunkCache.get(key)); return; }
-
     setHL(w.range);
-    showTip(w.word, '分析短语中…', false);
-    chrome.runtime.sendMessage({ type: 'chunk', word: w.word, context: w.context }, res => {
-      if (chunkKey !== key) return; // pointer moved on
-      if (chrome.runtime.lastError) {
-        showTip(w.word, '失败：' + chrome.runtime.lastError.message, false);
-      } else if (!res || res.error) {
-        showTip(w.word, '失败：' + ((res && res.error) || '后台无响应'), false);
-      } else {
-        chunkCache.set(key, res);
-        apply(res);
+    showTip(w.word, '分析成分中…', false);
+    if (segCache.get(key) === 'pending') return; // the reply will show the tip for the current pointer
+
+    segCache.set(key, 'pending');
+    askBg({ type: 'segment', sentence: key }, res => {
+      if (res.error) {
+        segCache.delete(key);
+        if (chunkKey.startsWith(key + '#')) showTip(w.word, '失败：' + res.error, false);
+        return;
+      }
+      segCache.set(key, res.segments);
+      // Show whatever word the pointer is on now, not the one that triggered the request
+      const cur = chunkKey;
+      if (cur.startsWith(key + '#')) {
+        const off = Number(cur.slice(key.length + 1));
+        const seg = res.segments.find(g => off >= g.start && off < g.end);
+        if (seg) {
+          const r = rangeFromOffsets(s.range, seg.start, seg.end);
+          setHL(r || w.range);
+          showTip(seg.text.length > 60 ? seg.text.slice(0, 60) + '…' : seg.text, seg.zh, true);
+        }
       }
     });
   }
 
+  // Requests to the background. If the background queued the job for a later retry (provider limit),
+  // the answer arrives later as a 'result' message with the same id; cb is called once in either case.
+  const pendingJobs = new Map(); // job id -> callback
+  function askBg(msg, cb) {
+    chrome.runtime.sendMessage(msg, res => {
+      if (chrome.runtime.lastError) return cb({ error: chrome.runtime.lastError.message });
+      if (res && res.queued) { pendingJobs.set(res.id, cb); return; }
+      cb(res || { error: '后台无响应' });
+    });
+  }
+  chrome.runtime.onMessage.addListener(msg => {
+    if (msg && msg.type === 'result' && pendingJobs.has(msg.id)) {
+      const cb = pendingJobs.get(msg.id);
+      pendingJobs.delete(msg.id);
+      cb(msg.ok ? msg.data : { error: msg.error });
+    }
+    return false;
+  });
+
   function setHL(range) {
+    if (range) anchorRect = range.getBoundingClientRect();
     if (hasHL) CSS.highlights.set('dsh-hover', new Highlight(range));
   }
 
   document.addEventListener('mousemove', e => {
     mx = e.clientX;
     my = e.clientY;
-
     // Sentence meaning: holding Shift, or the debug switch "直接显示句意"
     if (settings.shiftEnabled && (e.shiftKey || settings.dbgSentence)) { sentenceMode(mx, my); return; }
     sentKey = '';
@@ -416,27 +512,49 @@
     const term = phraseAt(mx, my);
     if (term) {
       lastKey = '';
-      const r = document.createRange();
-      r.selectNodeContents(term);
-      setHL(r);
-      showTip(term.textContent, term.dataset.zh, true);
+      // Same phrase still under the pointer: do not rewrite the highlight or the tip on every mouse move
+      if (term !== lastTerm) {
+        lastTerm = term;
+        const r = document.createRange();
+        r.selectNodeContents(term);
+        setHL(r);
+        showTip(term.textContent, term.dataset.zh, true);
+      }
       return;
     }
+    lastTerm = null;
 
     // Scope "phrase": annotated phrases only, no single-word hover
     if (settings.hoverScope === 'phrase') { lastKey = ''; hideTip(); return; }
 
     const w = wordAt(mx, my);
-    if (!w) { hideTip(); return; }
+    if (!w) {
+      // Pointer is on a glyph edge or a gap: keep the current tip instead of blinking it off.
+      // It is hidden only when the pointer leaves the word's box for real (handled by hideTip on scroll/blur).
+      return;
+    }
 
-    // Cache key includes the paragraph, so the same word in another sentence is looked up again
-    w.context = paragraphContext(w.range.startContainer);
+    // Cache key is word + its sentence. The cache is shared across the whole page, so the same word in
+    // the same sentence is looked up once, while the same word in another sentence gets its own meaning.
+    w.context = sentenceOfWord(w, mx, my);
     const key = w.word.toLowerCase() + '|' + w.context;
-    if (key === lastKey) { place(); return; }
+    // Same word still under the pointer: do nothing, so the tip is not rewritten on every mouse move
+    if (key === lastKey) return;
     lastKey = key;
     setHL(w.range);
-    showWordMeaning(w, key, false);
+
+    // Cached meanings show at once. Uncached words wait until the pointer rests on them,
+    // so sweeping across a line does not fire one request per word (that caused the flicker and retries).
+    if (memCache.has(key)) { showTip(w.word, memCache.get(key), false); return; }
+    clearTimeout(restTimer);
+    restTimer = setTimeout(() => {
+      if (lastKey === key) showWordMeaning(w, key, false);
+    }, REST_MS);
   });
+
+  let restTimer = null;
+  const REST_MS = 300;
+  let lastTerm = null; // phrase element currently shown, so repeated mouse moves over it do not repaint
 
   // Word meaning in context. force=true ignores the cache (used by middle-click refresh).
   function showWordMeaning(w, key, force) {
@@ -446,11 +564,9 @@
     }
     showTip(w.word, '查询中…', false);
     const id = ++reqId;
-    chrome.runtime.sendMessage({ type: 'lookup', word: w.word, context: w.context, force: !!force }, res => {
+    askBg({ type: 'lookup', word: w.word, context: w.context, force: !!force }, res => {
       if (id !== reqId || lastKey !== key) return; // stale response
-      if (chrome.runtime.lastError || !res) {
-        showTip(w.word, '查询失败', false);
-      } else if (res.error) {
+      if (res.error) {
         showTip(w.word, '错误：' + res.error, false);
       } else {
         memCache.set(key, res.zh);
@@ -459,12 +575,12 @@
     });
   }
 
-  // Middle-click a word: drop its cached meaning for this context and query again
+  // Middle-click a word: drop its cached meaning for this sentence and query again
   function refreshWordAt(x, y) {
     const w = wordAt(x, y);
     if (!w) return false;
     mx = x; my = y;
-    w.context = paragraphContext(w.range.startContainer);
+    w.context = sentenceOfWord(w, x, y);
     const key = w.word.toLowerCase() + '|' + w.context;
     memCache.delete(key);
     lastKey = key;
@@ -495,7 +611,7 @@
   // Started by the popup after injection
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'start') {
-      analyze().catch(err => showToast('分析出错：' + err.message, 6000));
+      analyze(!!msg.force).catch(err => showToast('分析出错：' + err.message, 6000));
       sendResponse({ ok: true });
     }
     return false;
