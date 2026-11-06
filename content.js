@@ -13,6 +13,7 @@
   const ABBR = new Set(['e.g', 'i.e', 'vs', 'etc', 'dr', 'mr', 'mrs', 'ms', 'st', 'no', 'fig', 'approx', 'u.s', 'u.k', 'a.m', 'p.m']);
   const CLOSERS = '"\'”’)]）】';
   let lastKey = '';
+  let lastHover = null;
   let sentKey = '';
   let chunkKey = ''; // Ctrl mode: word|context currently being shown
   let reqId = 0;
@@ -345,6 +346,8 @@
   function hideTip() {
     tip.style.display = 'none';
     lastKey = '';
+    lastHover = null;
+    lastTerm = null;
     sentKey = '';
     chunkKey = '';
     if (hasHL) CSS.highlights.delete('dsh-hover');
@@ -500,11 +503,11 @@
     mx = e.clientX;
     my = e.clientY;
     // Sentence meaning: holding Shift, or the debug switch "直接显示句意"
-    if (settings.shiftEnabled && (e.shiftKey || settings.dbgSentence)) { sentenceMode(mx, my); return; }
+    if (settings.shiftEnabled && (e.shiftKey || settings.dbgSentence)) { lastHover = null; sentenceMode(mx, my); return; }
     sentKey = '';
 
     // Constituent meaning: holding Ctrl, or the debug switch "直接显示成分"
-    if (settings.ctrlEnabled && (e.ctrlKey || settings.dbgChunk)) { chunkMode(mx, my); return; }
+    if (settings.ctrlEnabled && (e.ctrlKey || settings.dbgChunk)) { lastHover = null; chunkMode(mx, my); return; }
     chunkKey = '';
 
     if (!settings.hoverEnabled) { hideTip(); return; }
@@ -512,6 +515,7 @@
     const term = phraseAt(mx, my);
     if (term) {
       lastKey = '';
+      lastHover = null;
       // Same phrase still under the pointer: do not rewrite the highlight or the tip on every mouse move
       if (term !== lastTerm) {
         lastTerm = term;
@@ -529,31 +533,29 @@
 
     const w = wordAt(mx, my);
     if (!w) {
-      // Pointer is on a glyph edge or a gap: keep the current tip instead of blinking it off.
-      // It is hidden only when the pointer leaves the word's box for real (handled by hideTip on scroll/blur).
+      hideTip();
       return;
     }
+
+    // A mouse move within the same word needs no sentence scan or redraw.
+    const hover = { node: w.range.startContainer, offset: w.range.startOffset, word: w.word };
+    if (lastHover && lastHover.node === hover.node && lastHover.offset === hover.offset && lastHover.word === hover.word) return;
+    lastHover = hover;
 
     // Cache key is word + its sentence. The cache is shared across the whole page, so the same word in
     // the same sentence is looked up once, while the same word in another sentence gets its own meaning.
     w.context = sentenceOfWord(w, mx, my);
     const key = w.word.toLowerCase() + '|' + w.context;
     // Same word still under the pointer: do nothing, so the tip is not rewritten on every mouse move
-    if (key === lastKey) return;
+    if (key === lastKey) { setHL(w.range); place(); return; }
     lastKey = key;
     setHL(w.range);
 
-    // Cached meanings show at once. Uncached words wait until the pointer rests on them,
-    // so sweeping across a line does not fire one request per word (that caused the flicker and retries).
+    // Update the visible word immediately; the network response arrives asynchronously.
     if (memCache.has(key)) { showTip(w.word, memCache.get(key), false); return; }
-    clearTimeout(restTimer);
-    restTimer = setTimeout(() => {
-      if (lastKey === key) showWordMeaning(w, key, false);
-    }, REST_MS);
+    showWordMeaning(w, key, false);
   });
 
-  let restTimer = null;
-  const REST_MS = 300;
   let lastTerm = null; // phrase element currently shown, so repeated mouse moves over it do not repaint
 
   // Word meaning in context. force=true ignores the cache (used by middle-click refresh).
