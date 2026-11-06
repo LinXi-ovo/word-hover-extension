@@ -14,17 +14,19 @@
   const CLOSERS = '"\'”’)]）】';
   let lastKey = '';
   let sentKey = '';
+  let chunkKey = ''; // Ctrl mode: word|context currently being shown
+  const chunkCache = new Map(); // word|context -> {chunk, zh}, for this page only
   let reqId = 0;
   let mx = 0, my = 0;
 
   // User switches (popup). Both default to on; changes apply live via storage.onChanged.
-  const settings = { hoverEnabled: true, shiftEnabled: true };
-  chrome.storage.local.get({ hoverEnabled: true, shiftEnabled: true }).then(s => Object.assign(settings, s));
+  const SWITCHES = ['hoverEnabled', 'shiftEnabled', 'ctrlEnabled'];
+  const settings = { hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true };
+  chrome.storage.local.get({ hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true }).then(s => Object.assign(settings, s));
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
-    if ('hoverEnabled' in changes) settings.hoverEnabled = !!changes.hoverEnabled.newValue;
-    if ('shiftEnabled' in changes) settings.shiftEnabled = !!changes.shiftEnabled.newValue;
-    if (!settings.hoverEnabled || !settings.shiftEnabled) hideTip();
+    SWITCHES.forEach(k => { if (k in changes) settings[k] = !!changes[k].newValue; });
+    if (!settings.hoverEnabled || !settings.shiftEnabled || !settings.ctrlEnabled) hideTip();
   });
 
   const tip = document.createElement('div');
@@ -287,6 +289,7 @@
     tip.style.display = 'none';
     lastKey = '';
     sentKey = '';
+    chunkKey = '';
     if (hasHL) CSS.highlights.delete('dsh-hover');
   }
 
@@ -326,6 +329,65 @@
     }
   }
 
+  // Ctrl mode: meaning of the phrase/collocation containing the word under the pointer
+  // Range for `chunk` inside the text node, choosing the occurrence that covers the word start
+  function chunkRange(node, chunk, wStart) {
+    const text = node.nodeValue;
+    for (let i = text.indexOf(chunk); i >= 0; i = text.indexOf(chunk, i + 1)) {
+      if (i <= wStart && wStart < i + chunk.length) {
+        const r = document.createRange();
+        r.setStart(node, i);
+        r.setEnd(node, i + chunk.length);
+        return r;
+      }
+    }
+    return null;
+  }
+
+  // Whole paragraph text around the word. Analysis wraps phrases in <span>, which splits text nodes,
+  // so a single text node may hold only a fragment of the sentence.
+  function paragraphContext(node) {
+    return blockOf(node).textContent.replace(/\s+/g, ' ').trim().slice(0, 800);
+  }
+
+  function chunkMode(x, y) {
+    const w = wordAt(x, y);
+    if (!w) { hideTip(); return; }
+    w.context = paragraphContext(w.range.startContainer);
+    const key = w.word.toLowerCase() + '|' + w.context;
+
+    // Highlight the chunk if it is found around the word; otherwise just the word
+    const apply = res => {
+      // The title is the model's unit whenever it contains the word; the highlight may fall back to the word
+      // (the page text can be split by existing annotations, so the unit is not always in one text node)
+      const unitOk = res.chunk.toLowerCase().includes(w.word.toLowerCase());
+      const r = unitOk ? chunkRange(w.range.startContainer, res.chunk, w.range.startOffset) : null;
+      setHL(r || w.range);
+      showTip(unitOk ? res.chunk : w.word, res.zh, true);
+    };
+
+    if (key === chunkKey) {
+      if (chunkCache.has(key)) apply(chunkCache.get(key)); // in flight otherwise: keep waiting
+      return;
+    }
+    chunkKey = key;
+    if (chunkCache.has(key)) { apply(chunkCache.get(key)); return; }
+
+    setHL(w.range);
+    showTip(w.word, '分析短语中…', false);
+    chrome.runtime.sendMessage({ type: 'chunk', word: w.word, context: w.context }, res => {
+      if (chunkKey !== key) return; // pointer moved on
+      if (chrome.runtime.lastError) {
+        showTip(w.word, '失败：' + chrome.runtime.lastError.message, false);
+      } else if (!res || res.error) {
+        showTip(w.word, '失败：' + ((res && res.error) || '后台无响应'), false);
+      } else {
+        chunkCache.set(key, res);
+        apply(res);
+      }
+    });
+  }
+
   function setHL(range) {
     if (hasHL) CSS.highlights.set('dsh-hover', new Highlight(range));
   }
@@ -337,6 +399,10 @@
     // Hold Shift: sentence meaning mode (if enabled); otherwise fall through to word hover
     if (e.shiftKey && settings.shiftEnabled) { sentenceMode(mx, my); return; }
     sentKey = '';
+
+    // Hold Ctrl: phrase/collocation meaning (if enabled)
+    if (e.ctrlKey && settings.ctrlEnabled) { chunkMode(mx, my); return; }
+    chunkKey = '';
 
     if (!settings.hoverEnabled) { hideTip(); return; }
 
@@ -382,9 +448,10 @@
   // Pressing Shift switches to sentence mode immediately; releasing returns to word mode
   document.addEventListener('keydown', e => {
     if (e.key === 'Shift' && !e.repeat && settings.shiftEnabled) sentenceMode(mx, my);
+    if (e.key === 'Control' && !e.repeat && settings.ctrlEnabled) chunkMode(mx, my);
   });
   document.addEventListener('keyup', e => {
-    if (e.key === 'Shift') hideTip();
+    if (e.key === 'Shift' || e.key === 'Control') hideTip();
   });
   window.addEventListener('blur', hideTip);
 

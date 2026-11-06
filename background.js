@@ -6,6 +6,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'lookup') task = lookup(msg);
   if (msg.type === 'annotate') task = annotate(msg);
   if (msg.type === 'sentence') task = sentence(msg);
+  if (msg.type === 'chunk') task = chunk(msg);
   // Settings-page tools: they use the form values passed in msg.cfg (not yet saved)
   if (msg.type === 'listModels') task = listModels(msg);
   if (msg.type === 'testConnection') task = testConnection(msg);
@@ -162,6 +163,38 @@ async function sentence({ text }) {
   const zh = String(out.zh || '').trim() || '暂无译文';
   await chrome.storage.local.set({ [key]: zh });
   return { zh };
+}
+
+// Ctrl mode: the smallest meaningful unit containing the word (phrasal verb, collocation, phrase).
+// Longer than one word, shorter than the sentence. Cached in chrome.storage.local.
+async function chunk({ word, context }) {
+  const key = 'c:' + word.toLowerCase() + '|' + context;
+  const cached = (await chrome.storage.local.get(key))[key];
+  if (cached) return cached;
+  // Step 1: ask for ALL multi-word units in the text (a list is more reliable than asking about one word)
+  const out = await callJSON(
+    'List the meaningful multi-word units in the English text below: phrasal verbs, verb + object/complement, ' +
+    'fixed collocations, and noun or adjective phrases. Each unit has 2 to 6 words and is copied verbatim from the text. ' +
+    'For each unit give a short Chinese meaning in this context. ' +
+    'Return JSON {"units":[{"text":"...","zh":"..."}]}.\n\nTEXT:\n"""' + context + '"""',
+    8192
+  );
+  const units = (Array.isArray(out.units) ? out.units : [])
+    .map(u => ({ text: String((u && u.text) || '').trim(), zh: String((u && u.zh) || '').trim() }))
+    .filter(u => u.text && u.zh);
+
+  // Step 2: locally pick the shortest unit that contains the word as a whole word
+  const wordRe = new RegExp('(^|[^A-Za-z])' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z]|$)', 'i');
+  const hits = units
+    .filter(u => /\s/.test(u.text) && wordRe.test(u.text))
+    .sort((a, b) => a.text.split(/\s+/).length - b.text.split(/\s+/).length);
+
+  const result = hits.length
+    ? { chunk: hits[0].text, zh: hits[0].zh }
+    : { chunk: word, zh: '这个词前后没有可识别的多词短语' };
+  // Cache only successful unit matches; a miss may be a model hiccup and should be retried later
+  if (hits.length) await chrome.storage.local.set({ [key]: result });
+  return result;
 }
 
 // Pick learnable words/phrases in a chunk of page text

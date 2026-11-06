@@ -97,16 +97,18 @@ async function chatPing(cfg) {
   $('endpoint').value = cfg.endpoint;
   $('model').value = cfg.model;
   $('status').textContent = `Word Hover 释义助手 ${chrome.runtime.getManifest().version}`;
-  const sw = await chrome.storage.local.get({ hoverEnabled: true, shiftEnabled: true });
+  const sw = await chrome.storage.local.get({ hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true });
   $('hoverEnabled').checked = sw.hoverEnabled;
   $('shiftEnabled').checked = sw.shiftEnabled;
+  $('ctrlEnabled').checked = sw.ctrlEnabled;
 })();
 
 // Feature switches save immediately; content scripts pick them up through storage.onChanged
-['hoverEnabled', 'shiftEnabled'].forEach(id => {
+const SWITCH_NAMES = { hoverEnabled: '单词悬浮', shiftEnabled: 'Shift 句意', ctrlEnabled: 'Ctrl 短语含义' };
+Object.keys(SWITCH_NAMES).forEach(id => {
   $(id).addEventListener('change', async () => {
     await chrome.storage.local.set({ [id]: $(id).checked });
-    $('status').textContent = `${id === 'hoverEnabled' ? '单词悬浮' : 'Shift 句意'}已${$(id).checked ? '开启' : '关闭'}`;
+    $('status').textContent = `${SWITCH_NAMES[id]}已${$(id).checked ? '开启' : '关闭'}`;
   });
 });
 

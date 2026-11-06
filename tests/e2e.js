@@ -150,10 +150,42 @@ function log(...a) { console.log(...a); }
   log(`[${hiddenShiftOff ? 'PASS' : 'FAIL'}] 关闭 Shift 句意后不显示句意`);
   const r7 = hiddenWhenOff && hiddenShiftOff;
 
+  // 8) Ctrl phrase mode: switch word hover and Shift back on, Ctrl on; hover "tackle" in p1
+  await pop.bringToFront();
+  await pop.check('#hoverEnabled');
+  await pop.check('#shiftEnabled');
+  await pop.check('#ctrlEnabled');
+  await pop.waitForTimeout(300);
+  await page.bringToFront();
+  const tb = await page.evaluate(() => {
+    const walker = document.createTreeWalker(document.getElementById('p1'), NodeFilter.SHOW_TEXT);
+    let tn = null, i = -1;
+    while (walker.nextNode()) { i = walker.currentNode.nodeValue.indexOf('tackle'); if (i >= 0) { tn = walker.currentNode; break; } }
+    const r = document.createRange(); r.setStart(tn, i); r.setEnd(tn, i + 'tackle'.length);
+    const b = r.getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 };
+  });
+  await page.mouse.move(tb.x - 5, tb.y);
+  await page.keyboard.down('Control');
+  await page.mouse.move(tb.x, tb.y);
+  // Diagnostic: sample the tip every 1s for 20s so we can see whether the multi-word result ever arrives
+  const seen = [];
+  for (let t = 0; t < 20; t++) {
+    await page.waitForTimeout(1000);
+    const s = (await page.textContent('#dsh-tip').catch(() => '')).trim();
+    if (!seen.length || seen[seen.length - 1] !== s) seen.push(s);
+  }
+  log('  [diag] ctrl tip sequence:', JSON.stringify(seen));
+  const ctrlTip = seen[seen.length - 1] || '';
+  await page.keyboard.up('Control');
+  // Must be a multi-word unit (e.g. "tackle global health challenges"), not just the single word
+  const chunkTitle = ctrlTip.split(/[\u4e00-\u9fff]/)[0].trim();
+  const r8 = /tackle/i.test(chunkTitle) && /\s/.test(chunkTitle) && !/失败|错误|未设置/.test(ctrlTip);
+  log(`[${r8 ? 'PASS' : 'FAIL'}] Ctrl 短语含义: ${ctrlTip}`);
+
   await context.close();
   server.close();
   fs.rmSync(userDataDir, { recursive: true, force: true });
-  const all = [r1, r2, r3, r4, r5, r6, r7];
+  const all = [r1, r2, r3, r4, r5, r6, r7, r8];
   log(`\nSUMMARY: ${all.filter(Boolean).length}/${all.length} passed`);
   process.exit(all.every(Boolean) ? 0 : 1);
 })().catch(err => { console.error('E2E ERROR:', err.message); process.exit(2); });
