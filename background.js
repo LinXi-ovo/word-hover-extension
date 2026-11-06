@@ -73,7 +73,8 @@ async function callJSONOnce(prompt, maxTokens, system) {
     try {
       return await requestJSON(prompt, maxTokens, system);
     } catch (err) {
-      const limited = /tier_limit_exceeded|concurrency limit|rate.?limit|\b429\b/i.test(err.message);
+      // Also retry an empty reply: some providers answer 200 without choices under load
+      const limited = /tier_limit_exceeded|concurrency limit|rate.?limit|\b429\b|返回空内容|没有 choices|finish_reason=undefined/i.test(err.message);
       if (!limited || attempt >= 4) throw err;
       await sleep(1000 * attempt * attempt); // 1s, 4s, 9s
     }
@@ -233,47 +234,75 @@ function sentenceOf(context, word) {
   return sentences.find(s => re.test(s)) || String(context);
 }
 
-// Ctrl mode: the complete constituent that contains the word, inside the hovered sentence.
-// Step 1 asks for that constituent directly; step 2 lists the sentence's units and picks the shortest valid one.
-// Only a valid multi-word constituent is cached; a miss is returned uncached so it can be retried.
+// Ctrl mode: a constituent that contains the word, inside the hovered sentence.
+// A constituent is a grammatical unit longer than a phrase and shorter than the sentence, e.g.
+//   - a noun phrase with long modifiers ("the prompt diagnosis, investigation and follow-up of cases")
+//   - coordinated words/phrases/clauses ("A, B and C", "X or Y")
+//   - a subordinate clause ("which led to ...", "that occur within ...")
+//   - a prepositional or with-phrase used as an adverbial ("with strong political commitment")
+//   - a verb phrase with its object or complement
+// Step 1 asks for the constituent directly; step 2 lists the sentence's constituents and picks one by local rules.
+// Only a valid constituent is cached; a miss is returned uncached so it can be retried.
+const CHUNK_MIN_WORDS = 2;
+const CHUNK_MAX_WORDS = 30;
+const CONSTITUENT_TYPES =
+  'a noun phrase with its modifiers (possibly long, e.g. with several attributive words or an "of" phrase), ' +
+  'coordinated words, phrases or clauses joined by and/or/but, a subordinate clause (that/which/when/if/because ...), ' +
+  'a prepositional or with-phrase used as an adverbial, a verb phrase with its object or complement, or a phrasal verb or fixed collocation';
+
 async function chunk({ word, context, sentence }) {
   const sent = sentence || sentenceOf(context, word);
-  const key = 'c2:' + word.toLowerCase() + '|' + hashKey(sent);
+  const key = 'c3:' + word.toLowerCase() + '|' + hashKey(sent);
   const cached = (await chrome.storage.local.get(key))[key];
   if (cached) return cached;
 
   const wordRe = wordPattern(word);
-  const valid = c => /\s/.test(c) && wordRe.test(c) && sent.includes(c);
+  const wordCount = c => c.split(/\s+/).filter(Boolean).length;
+  const norm = s => s.replace(/[.!?;:,。！？；：]+$/, '').trim();
+  // Valid: copied from the sentence, contains the target word, has a sensible size, and is not the whole sentence
+  const valid = c => {
+    const n = wordCount(c);
+    return n >= CHUNK_MIN_WORDS && n <= CHUNK_MAX_WORDS && wordRe.test(c) &&
+      sent.includes(c) && norm(c) !== norm(sent);
+  };
 
-  // Step 1: the constituent containing the word, as one grammatical unit
+  // Step 1: the constituent containing the word
   let found = null;
   const direct = await callJSON(
     `Sentence: """${sent}"""\nTarget word: "${word}"\n` +
-    'Find the smallest complete constituent that contains the target word and works as one grammatical unit: ' +
-    'a verb with its object or complement, a noun phrase with its modifiers, a prepositional phrase, or a fixed collocation or phrasal verb. ' +
-    'It must have 2 to 8 words, be copied verbatim from the sentence, contain the target word, and must not be the whole clause or sentence. ' +
-    'Give its short Chinese meaning in this sentence. Return JSON {"chunk":"...","zh":"..."}.',
+    `Find the smallest complete constituent that contains the target word and is a single grammatical unit. ` +
+    `It may be ${CONSTITUENT_TYPES}. ` +
+    'It must be copied verbatim from the sentence, contain the target word, be longer than a two-word phrase where the grammar allows, ' +
+    'and must NOT be the whole sentence or a whole main clause. ' +
+    'Give "zh" as a short Chinese gloss of the whole unit in this sentence, at most 25 Chinese characters, no grammar analysis. ' +
+    'Return JSON {"chunk":"...","zh":"..."}.',
     2048, SYS_CHUNK
   );
   const dc = String(direct.chunk || '').trim();
   if (valid(dc)) found = { chunk: dc, zh: String(direct.zh || '').trim() || '暂无释义' };
 
-  // Step 2 (fallback): list the sentence's multi-word units and pick the shortest valid one
+  // Step 2 (fallback): list the sentence's constituents and pick the one by local rules
   if (!found) {
     const out = await callJSON(
-      'List the multi-word constituents in the sentence below: phrasal verbs, verb + object/complement, ' +
-      'noun and adjective phrases, prepositional phrases. Each has 2 to 8 words and is copied verbatim. ' +
-      'Give a short Chinese meaning for each in this sentence. Return JSON {"units":[{"text":"...","zh":"..."}]}.\n\nSENTENCE:\n"""' + sent + '"""',
+      `List the grammatical constituents in the sentence below. Each one is ${CONSTITUENT_TYPES}. ` +
+      'Each must be copied verbatim from the sentence, be longer than a single word, and must not be the whole sentence. ' +
+      'Give "zh" for each as a short Chinese gloss of the whole unit, at most 25 Chinese characters, no grammar analysis. ' +
+      'Return JSON {"units":[{"text":"...","zh":"..."}]}.\n\nSENTENCE:\n"""' + sent + '"""',
       4096, SYS_CHUNK
     );
     const units = (Array.isArray(out.units) ? out.units : [])
       .map(u => ({ text: String((u && u.text) || '').trim(), zh: String((u && u.zh) || '').trim() }))
       .filter(u => u.text && u.zh && valid(u.text))
-      .sort((a, b) => a.text.split(/\s+/).length - b.text.split(/\s+/).length);
+      // Prefer the smallest constituent of at least three words (a real constituent, not a stray pair);
+      // fall back to a two-word unit only if nothing longer contains the word
+      .sort((a, b) => {
+        const ka = wordCount(a.text) >= 3 ? 0 : 1, kb = wordCount(b.text) >= 3 ? 0 : 1;
+        return ka - kb || wordCount(a.text) - wordCount(b.text);
+      });
     if (units.length) found = { chunk: units[0].text, zh: units[0].zh };
   }
 
-  if (!found) return { chunk: word, zh: '未找到多词成分' };
+  if (!found) return { chunk: word, zh: '未找到成分' };
   await chrome.storage.local.set({ [key]: found });
   return found;
 }
