@@ -36,7 +36,51 @@ function normalizeEndpoint(url) {
   return u + '/chat/completions';
 }
 
-async function callJSON(prompt, maxTokens = 4096) {
+// One system prompt per job, so word, sentence, constituent and annotation requests do not interfere
+const SYS_DEFAULT = 'You are a precise English-to-Chinese assistant. Reply with a single JSON object.';
+const SYS_WORD = 'You are an English dictionary for learners. Give the Chinese meaning of a word exactly as it is used in the given sentence. Reply with one JSON object.';
+const SYS_SENT = 'You are a professional English-to-Chinese translator. Translate faithfully and naturally. Reply with one JSON object.';
+const SYS_CHUNK = 'You are an English grammar analyst. You identify phrases and constituents, copy them exactly from the text, and explain their Chinese meaning in context. Reply with one JSON object.';
+const SYS_ANNOT = 'You are an English vocabulary teacher choosing items worth learning from a text. Copy items exactly from the text. Reply with one JSON object.';
+
+// Concurrency gate: hover, sentence, constituent and analysis requests can fire together and exceed the
+// provider's concurrent-request limit (HTTP 400 tier_limit_exceeded). Keep at most MAX_CONCURRENT in flight.
+const MAX_CONCURRENT = 3;
+let inFlight = 0;
+const waiting = [];
+function acquire() {
+  if (inFlight < MAX_CONCURRENT) { inFlight++; return Promise.resolve(); }
+  return new Promise(resolve => waiting.push(resolve));
+}
+function release() {
+  const next = waiting.shift();
+  if (next) next(); else inFlight--;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function callJSON(prompt, maxTokens = 4096, system = SYS_DEFAULT) {
+  await acquire();
+  try {
+    return await callJSONOnce(prompt, maxTokens, system);
+  } finally {
+    release();
+  }
+}
+
+// Retry on rate/concurrency limits with growing backoff; other errors are raised at once
+async function callJSONOnce(prompt, maxTokens, system) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await requestJSON(prompt, maxTokens, system);
+    } catch (err) {
+      const limited = /tier_limit_exceeded|concurrency limit|rate.?limit|\b429\b/i.test(err.message);
+      if (!limited || attempt >= 4) throw err;
+      await sleep(1000 * attempt * attempt); // 1s, 4s, 9s
+    }
+  }
+}
+
+async function requestJSON(prompt, maxTokens, system) {
   const cfg = await chrome.storage.local.get({ apiKey: '', endpoint: DEFAULTS.endpoint, model: DEFAULTS.model });
   if (!cfg.apiKey) throw new Error('未设置 API Key，请点击扩展图标填写');
   const res = await fetch(normalizeEndpoint(cfg.endpoint), {
@@ -45,7 +89,7 @@ async function callJSON(prompt, maxTokens = 4096) {
     body: JSON.stringify({
       model: cfg.model,
       messages: [
-        { role: 'system', content: 'You are a precise English-to-Chinese vocabulary assistant. Always reply with a single JSON object.' },
+        { role: 'system', content: system },
         { role: 'user', content: prompt }
       ],
       response_format: { type: 'json_object' },
@@ -71,7 +115,8 @@ async function lookup({ word, context, force }) {
   }
   const out = await callJSON(
     `Give a concise Chinese meaning (at most 15 Chinese characters) of the English word "${word}" ` +
-    `as it is used in the sentence that contains it, in this text: """${context}""". Return JSON {"zh": "..."}.`
+    `as it is used in the sentence that contains it, in this text: """${context}""". Return JSON {"zh": "..."}.`,
+    4096, SYS_WORD
   );
   const zh = String(out.zh || '').trim() || '暂无释义';
   await chrome.storage.local.set({ [key]: zh });
@@ -168,46 +213,69 @@ async function sentence({ text }) {
   if (cached) return { zh: cached };
   const out = await callJSON(
     'Translate the English sentence below into natural, accurate Chinese. ' +
-    'Return JSON {"zh": "..."}.\n\nSENTENCE:\n"""' + text + '"""'
+    'Return JSON {"zh": "..."}.\n\nSENTENCE:\n"""' + text + '"""',
+    4096, SYS_SENT
   );
   const zh = String(out.zh || '').trim() || '暂无译文';
   await chrome.storage.local.set({ [key]: zh });
   return { zh };
 }
 
-// Ctrl mode: the smallest meaningful unit containing the word (phrasal verb, collocation, phrase).
-// Longer than one word, shorter than the sentence. Cached in chrome.storage.local.
-async function chunk({ word, context }) {
-  const key = 'c:' + word.toLowerCase() + '|' + hashKey(context);
+// Regex that matches the word as a whole word (case-insensitive)
+function wordPattern(word) {
+  return new RegExp('(^|[^A-Za-z])' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z]|$)', 'i');
+}
+
+// The sentence in the paragraph that contains the word; used when the page did not pass the hovered sentence
+function sentenceOf(context, word) {
+  const re = wordPattern(word);
+  const sentences = String(context).split(/(?<=[.!?])\s+/);
+  return sentences.find(s => re.test(s)) || String(context);
+}
+
+// Ctrl mode: the complete constituent that contains the word, inside the hovered sentence.
+// Step 1 asks for that constituent directly; step 2 lists the sentence's units and picks the shortest valid one.
+// Only a valid multi-word constituent is cached; a miss is returned uncached so it can be retried.
+async function chunk({ word, context, sentence }) {
+  const sent = sentence || sentenceOf(context, word);
+  const key = 'c2:' + word.toLowerCase() + '|' + hashKey(sent);
   const cached = (await chrome.storage.local.get(key))[key];
   if (cached) return cached;
-  // Step 1: ask for ALL multi-word units in the text (a list is more reliable than asking about one word)
-  const out = await callJSON(
-    'List the meaningful multi-word units in the English text below: phrasal verbs, verb + object/complement, ' +
-    'fixed collocations, and noun or adjective phrases. Each unit has 2 to 6 words and is copied verbatim from the text. ' +
-    'For each unit give a short Chinese meaning in this context. ' +
-    'Return JSON {"units":[{"text":"...","zh":"..."}]}.\n\nTEXT:\n"""' + context + '"""',
-    8192
+
+  const wordRe = wordPattern(word);
+  const valid = c => /\s/.test(c) && wordRe.test(c) && sent.includes(c);
+
+  // Step 1: the constituent containing the word, as one grammatical unit
+  let found = null;
+  const direct = await callJSON(
+    `Sentence: """${sent}"""\nTarget word: "${word}"\n` +
+    'Find the smallest complete constituent that contains the target word and works as one grammatical unit: ' +
+    'a verb with its object or complement, a noun phrase with its modifiers, a prepositional phrase, or a fixed collocation or phrasal verb. ' +
+    'It must have 2 to 8 words, be copied verbatim from the sentence, contain the target word, and must not be the whole clause or sentence. ' +
+    'Give its short Chinese meaning in this sentence. Return JSON {"chunk":"...","zh":"..."}.',
+    2048, SYS_CHUNK
   );
-  const units = (Array.isArray(out.units) ? out.units : [])
-    .map(u => ({ text: String((u && u.text) || '').trim(), zh: String((u && u.zh) || '').trim() }))
-    .filter(u => u.text && u.zh);
+  const dc = String(direct.chunk || '').trim();
+  if (valid(dc)) found = { chunk: dc, zh: String(direct.zh || '').trim() || '暂无释义' };
 
-  // Step 2: locally pick the shortest unit that contains the word as a whole word,
-  // restricted to the sentence that contains the word (never across sentence boundaries)
-  const wordRe = new RegExp('(^|[^A-Za-z])' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z]|$)', 'i');
-  const sentences = String(context).split(/(?<=[.!?])\s+/);
-  const ownSentence = sentences.find(s => wordRe.test(s)) || String(context);
-  const hits = units
-    .filter(u => /\s/.test(u.text) && wordRe.test(u.text) && ownSentence.includes(u.text))
-    .sort((a, b) => a.text.split(/\s+/).length - b.text.split(/\s+/).length);
+  // Step 2 (fallback): list the sentence's multi-word units and pick the shortest valid one
+  if (!found) {
+    const out = await callJSON(
+      'List the multi-word constituents in the sentence below: phrasal verbs, verb + object/complement, ' +
+      'noun and adjective phrases, prepositional phrases. Each has 2 to 8 words and is copied verbatim. ' +
+      'Give a short Chinese meaning for each in this sentence. Return JSON {"units":[{"text":"...","zh":"..."}]}.\n\nSENTENCE:\n"""' + sent + '"""',
+      4096, SYS_CHUNK
+    );
+    const units = (Array.isArray(out.units) ? out.units : [])
+      .map(u => ({ text: String((u && u.text) || '').trim(), zh: String((u && u.zh) || '').trim() }))
+      .filter(u => u.text && u.zh && valid(u.text))
+      .sort((a, b) => a.text.split(/\s+/).length - b.text.split(/\s+/).length);
+    if (units.length) found = { chunk: units[0].text, zh: units[0].zh };
+  }
 
-  const result = hits.length
-    ? { chunk: hits[0].text, zh: hits[0].zh }
-    : { chunk: word, zh: '这个词前后没有可识别的多词短语' };
-  // Cache only successful unit matches; a miss may be a model hiccup and should be retried later
-  if (hits.length) await chrome.storage.local.set({ [key]: result });
-  return result;
+  if (!found) return { chunk: word, zh: '未找到多词成分' };
+  await chrome.storage.local.set({ [key]: found });
+  return found;
 }
 
 // Pick learnable words/phrases in a chunk of page text
@@ -217,7 +285,7 @@ async function annotate({ text }) {
     'Each "text" must be copied verbatim from the input (same spelling and case). ' +
     'Each "zh" is a short Chinese meaning in this context. ' +
     'Return JSON {"items":[{"text":"...","zh":"..."}]}.\n\nTEXT:\n"""' + text + '"""',
-    16000 // annotation is the heaviest call; a reasoning model needs a much larger budget
+    16000, SYS_ANNOT // annotation is the heaviest call; a reasoning model needs a much larger budget
   );
   const items = Array.isArray(out.items)
     ? out.items.filter(i => i && typeof i.text === 'string' && typeof i.zh === 'string')

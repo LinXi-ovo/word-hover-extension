@@ -97,19 +97,32 @@ async function chatPing(cfg) {
   $('endpoint').value = cfg.endpoint;
   $('model').value = cfg.model;
   $('status').textContent = `Word Hover 释义助手 ${chrome.runtime.getManifest().version}`;
-  const sw = await chrome.storage.local.get({ hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true });
+  const sw = await chrome.storage.local.get({
+    hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true,
+    dbgSentence: false, dbgChunk: false, hoverScope: 'word'
+  });
   $('hoverEnabled').checked = sw.hoverEnabled;
   $('shiftEnabled').checked = sw.shiftEnabled;
   $('ctrlEnabled').checked = sw.ctrlEnabled;
+  $('dbgSentence').checked = sw.dbgSentence;
+  $('dbgChunk').checked = sw.dbgChunk;
+  $('hoverPhraseOnly').checked = sw.hoverScope === 'phrase';
 })();
 
 // Feature switches save immediately; content scripts pick them up through storage.onChanged
-const SWITCH_NAMES = { hoverEnabled: '单词悬浮', shiftEnabled: 'Shift 句意', ctrlEnabled: 'Ctrl 短语含义' };
+const SWITCH_NAMES = {
+  hoverEnabled: '单词悬停', shiftEnabled: 'Shift 句意', ctrlEnabled: 'Ctrl 成分含义',
+  dbgSentence: '直接显示句意', dbgChunk: '直接显示成分'
+};
 Object.keys(SWITCH_NAMES).forEach(id => {
   $(id).addEventListener('change', async () => {
     await chrome.storage.local.set({ [id]: $(id).checked });
     $('status').textContent = `${SWITCH_NAMES[id]}已${$(id).checked ? '开启' : '关闭'}`;
   });
+});
+$('hoverPhraseOnly').addEventListener('change', async () => {
+  await chrome.storage.local.set({ hoverScope: $('hoverPhraseOnly').checked ? 'phrase' : 'word' });
+  $('status').textContent = $('hoverPhraseOnly').checked ? '已改为只悬停词组' : '已恢复单词悬停';
 });
 
 $('save').addEventListener('click', async () => {

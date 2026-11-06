@@ -19,6 +19,7 @@
   .toggles { margin-top: 12px; border-top: 1px solid #e5e7eb; padding-top: 8px; }
   .switch { display: flex; align-items: center; gap: 8px; margin-top: 6px; color: #1f2937; font-size: 13px; cursor: pointer; }
   .switch input { width: auto; margin: 0; }
+  .sub { color: #6b7280; font-size: 12px; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -45,7 +46,13 @@
   <div class="toggles">
     <label class="switch"><input id="hoverEnabled" type="checkbox"> 单词 / 词组悬浮释义</label>
     <label class="switch"><input id="shiftEnabled" type="checkbox"> 按住 Shift 查看句意</label>
-    <label class="switch"><input id="ctrlEnabled" type="checkbox"> 按住 Ctrl 查看短语含义</label>
+    <label class="switch"><input id="ctrlEnabled" type="checkbox"> 按住 Ctrl 查看成分含义</label>
+  </div>
+  <div class="toggles">
+    <div class="sub">调试：不按快捷键直接显示（用于排查快捷键问题）</div>
+    <label class="switch"><input id="dbgSentence" type="checkbox"> 直接显示句意</label>
+    <label class="switch"><input id="dbgChunk" type="checkbox"> 直接显示成分</label>
+    <label class="switch"><input id="hoverPhraseOnly" type="checkbox"> 悬停只显示词组（关闭单词悬停）</label>
   </div>
   <div id="status"></div>
   <div id="diag"></div>

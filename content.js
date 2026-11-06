@@ -20,13 +20,20 @@
   let mx = 0, my = 0;
 
   // User switches (popup). Both default to on; changes apply live via storage.onChanged.
-  const SWITCHES = ['hoverEnabled', 'shiftEnabled', 'ctrlEnabled'];
-  const settings = { hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true };
-  chrome.storage.local.get({ hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true }).then(s => Object.assign(settings, s));
+  // dbgSentence / dbgChunk: show sentence meaning / constituent on hover without holding Shift / Ctrl (debug).
+  // hoverScope: 'word' = words and annotated phrases; 'phrase' = annotated phrases only.
+  const SWITCHES = ['hoverEnabled', 'shiftEnabled', 'ctrlEnabled', 'dbgSentence', 'dbgChunk', 'hoverScope'];
+  const DEFAULT_SETTINGS = { hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true, dbgSentence: false, dbgChunk: false, hoverScope: 'word' };
+  const settings = { ...DEFAULT_SETTINGS };
+  chrome.storage.local.get(DEFAULT_SETTINGS).then(s => Object.assign(settings, s));
+  // Only switch changes affect the hover state. Cache writes (sentence/chunk results) also fire this
+  // event, and hiding the tip on them would clear the in-flight key and drop the answer as "stale".
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
-    SWITCHES.forEach(k => { if (k in changes) settings[k] = !!changes[k].newValue; });
-    if (!settings.hoverEnabled || !settings.shiftEnabled || !settings.ctrlEnabled) hideTip();
+    const switched = SWITCHES.filter(k => k in changes);
+    if (!switched.length) return;
+    switched.forEach(k => { settings[k] = changes[k].newValue; });
+    hideTip();
   });
 
   const tip = document.createElement('div');
@@ -396,12 +403,12 @@
     mx = e.clientX;
     my = e.clientY;
 
-    // Hold Shift: sentence meaning mode (if enabled); otherwise fall through to word hover
-    if (e.shiftKey && settings.shiftEnabled) { sentenceMode(mx, my); return; }
+    // Sentence meaning: holding Shift, or the debug switch "直接显示句意"
+    if (settings.shiftEnabled && (e.shiftKey || settings.dbgSentence)) { sentenceMode(mx, my); return; }
     sentKey = '';
 
-    // Hold Ctrl: phrase/collocation meaning (if enabled)
-    if (e.ctrlKey && settings.ctrlEnabled) { chunkMode(mx, my); return; }
+    // Constituent meaning: holding Ctrl, or the debug switch "直接显示成分"
+    if (settings.ctrlEnabled && (e.ctrlKey || settings.dbgChunk)) { chunkMode(mx, my); return; }
     chunkKey = '';
 
     if (!settings.hoverEnabled) { hideTip(); return; }
@@ -415,6 +422,9 @@
       showTip(term.textContent, term.dataset.zh, true);
       return;
     }
+
+    // Scope "phrase": annotated phrases only, no single-word hover
+    if (settings.hoverScope === 'phrase') { lastKey = ''; hideTip(); return; }
 
     const w = wordAt(mx, my);
     if (!w) { hideTip(); return; }
