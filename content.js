@@ -16,6 +16,7 @@
   let lastHover = null;
   let sentKey = '';
   let chunkKey = ''; // Ctrl mode: word|context currently being shown
+  let renderedChunkKey = '';
   let reqId = 0;
   let mx = 0, my = 0;
   let anchorRect = null;
@@ -171,6 +172,12 @@
     showToast(`${prefix}成分分析中（${sents.length} 句，后台进行）…`);
     askBg({ type: 'segmentDoc', sentences: sents, force }, res => {
       if (res.error) { showToast(`${prefix}成分分析失败：${res.error}`, 8000); return; }
+      let refreshCurrent = false;
+      for (const [sentence, segments] of Object.entries(res.segmentsBySentence || {})) {
+        segCache.set(sentence, segments);
+        if (chunkKey.startsWith(sentence + '#')) refreshCurrent = true;
+      }
+      if (refreshCurrent) { renderedChunkKey = ''; chunkMode(mx, my); }
       const miss = res.total - res.done;
       showToast(`${prefix}成分已就绪：${res.done}/${res.total} 句${miss ? `（${miss} 句未成功，悬停时会单独重试）` : ''}。按住 Ctrl 悬停查看。`, 8000);
     });
@@ -350,6 +357,7 @@
     lastTerm = null;
     sentKey = '';
     chunkKey = '';
+    renderedChunkKey = '';
     if (hasHL) CSS.highlights.delete('dsh-hover');
   }
 
@@ -435,21 +443,26 @@
     if (wordOffset < 0 || wordOffset >= s.text.length) { hideTip(); return; }
 
     const key = s.text;
-    chunkKey = key + '#' + wordOffset;
+    const nextChunkKey = key + '#' + wordOffset;
+    if (renderedChunkKey === nextChunkKey && tip.style.display === 'block') return;
+    chunkKey = nextChunkKey;
 
     const show = segments => {
       const seg = segments.find(g => wordOffset >= g.start && wordOffset < g.end);
       if (!seg) { showTip(w.word, '未找到所在成分', false); return; }
       const r = rangeFromOffsets(s.range, seg.start, seg.end);
-      setHL(r || w.range);
+      if (r) setHL(r);
+      else if (hasHL) CSS.highlights.delete('dsh-hover');
       showTip(seg.text.length > 60 ? seg.text.slice(0, 60) + '…' : seg.text, seg.zh, true);
+      renderedChunkKey = nextChunkKey;
     };
 
     if (segCache.has(key) && Array.isArray(segCache.get(key))) {
       show(segCache.get(key));
       return;
     }
-    setHL(w.range);
+    anchorRect = w.range.getBoundingClientRect();
+    if (hasHL) CSS.highlights.delete('dsh-hover');
     showTip(w.word, '分析成分中…', false);
     if (segCache.get(key) === 'pending') return; // the reply will show the tip for the current pointer
 
@@ -468,8 +481,10 @@
         const seg = res.segments.find(g => off >= g.start && off < g.end);
         if (seg) {
           const r = rangeFromOffsets(s.range, seg.start, seg.end);
-          setHL(r || w.range);
+          if (r) setHL(r);
+          else if (hasHL) CSS.highlights.delete('dsh-hover');
           showTip(seg.text.length > 60 ? seg.text.slice(0, 60) + '…' : seg.text, seg.zh, true);
+          renderedChunkKey = cur;
         }
       }
     });

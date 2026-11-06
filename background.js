@@ -73,7 +73,7 @@ function scheduleRetry(job) {
 }
 
 function finishJob(job, body) {
-  queuedJobs--;
+  if (job.kind) queuedJobs--;
   chrome.tabs.sendMessage(job.tabId, { type: 'result', id: job.id, ...body }).catch(() => {});
 }
 
@@ -83,18 +83,20 @@ function finishJob(job, body) {
 async function segmentDocJob(sentences, job) {
   let done = 0;
   const total = sentences.length;
+  const segmentsBySentence = {};
   let next = 0;
   const worker = async () => {
     while (next < total) {
       const s = sentences[next++];
       try {
-        await segmentCore({ sentence: s, force: !!job.force }, 2);
+        const result = await segmentCore({ sentence: s, force: !!job.force }, 2);
+        segmentsBySentence[s] = result.segments;
         done++;
       } catch (_) { /* leave it; hover will retry this sentence */ }
     }
   };
   await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT, total) }, worker));
-  return { done, total };
+  return { done, total, segmentsBySentence };
 }
 
 function startSegmentDoc(msg, sender) {
