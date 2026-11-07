@@ -126,6 +126,58 @@ async function chatPing(cfg) {
   return { ms: r.ms, finish: choice.finish_reason, reply, model: data.model || cfg.model };
 }
 
+// Live progress mirrored from the content script of the active tab
+const STAGE_LABEL = { words: '词语·词组·句意', chunks: '成分', fill: '补充' };
+const STAGE_ORDER = ['words', 'chunks', 'fill'];
+const progressState = { stage: null, detail: '', pct: 0 };
+
+function renderProgress() {
+  const { stage, detail, pct } = progressState;
+  $('miniStage').textContent = stage ? STAGE_LABEL[stage] : '未开始分析';
+  const idx = stage ? STAGE_ORDER.indexOf(stage) : -1;
+  document.querySelectorAll('.mini-stop').forEach(stop => {
+    const i = STAGE_ORDER.indexOf(stop.dataset.key);
+    stop.classList.toggle('active', i === idx);
+    stop.classList.toggle('done', idx >= 0 && i < idx);
+  });
+  $('miniBarFill').style.width = Math.max(0, Math.min(100, pct)) + '%';
+  $('miniDetail').textContent = detail || (stage ? '' : '打开网页后点“分析本页”开始');
+}
+
+chrome.runtime.onMessage.addListener(msg => {
+  if (msg && msg.type === 'progress') {
+    progressState.stage = msg.stage || null;
+    progressState.detail = msg.detail || '';
+    progressState.pct = Number(msg.pct) || 0;
+    renderProgress();
+  }
+  return false;
+});
+
+// On open, pull the latest state from the active tab so reopening the popup shows where it is now
+(async () => {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) return;
+    const res = await chrome.tabs.sendMessage(tab.id, { type: 'progressState' });
+    if (res && res.stage) {
+      progressState.stage = res.stage;
+      progressState.detail = res.detail || '';
+      progressState.pct = Number(res.pct) || 0;
+      renderProgress();
+    }
+  } catch (_) { /* no content script on this page */ }
+})();
+
+// Tab bar: one panel shown at a time
+document.getElementById('tabs').addEventListener('click', e => {
+  const tab = e.target.closest('.tab');
+  if (!tab) return;
+  const key = tab.dataset.tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.dataset.panel === key));
+});
+
 (async () => {
   const cfg = await chrome.storage.local.get({ ...DEFAULTS, presets: [], activePresetId: '' });
   presets = Array.isArray(cfg.presets) ? cfg.presets : [];
@@ -138,7 +190,8 @@ async function chatPing(cfg) {
   $('status').textContent = `Word Hover 释义助手 ${chrome.runtime.getManifest().version}`;
   const sw = await chrome.storage.local.get({
     hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true,
-    dbgSentence: false, dbgChunk: false, hoverScope: 'word'
+    dbgSentence: false, dbgChunk: false, hoverScope: 'word',
+    fillAll: false, fillSource: 'ai', freeEndpoint: ''
   });
   $('hoverEnabled').checked = sw.hoverEnabled;
   $('shiftEnabled').checked = sw.shiftEnabled;
@@ -146,7 +199,29 @@ async function chatPing(cfg) {
   $('dbgSentence').checked = sw.dbgSentence;
   $('dbgChunk').checked = sw.dbgChunk;
   $('hoverPhraseOnly').checked = sw.hoverScope === 'phrase';
+  $('fillAll').checked = sw.fillAll;
+  $('fillSource').value = sw.fillSource === 'free' ? '1' : '0';
+  $('fillSourceLabel').textContent = sw.fillSource === 'free' ? '免费翻译接口（词典义）' : 'AI 语境义';
+  $('freeEndpoint').value = sw.freeEndpoint || '';
 })();
+
+// Bulk vocabulary fill: switch + source slider + free endpoint address
+$('fillAll').addEventListener('change', async () => {
+  await chrome.storage.local.set({ fillAll: $('fillAll').checked });
+  $('status').textContent = $('fillAll').checked ? '补充全部词汇已开启（下次分析本页生效）' : '补充全部词汇已关闭';
+});
+$('fillSource').addEventListener('input', () => {
+  $('fillSourceLabel').textContent = $('fillSource').value === '1' ? '免费翻译接口（词典义）' : 'AI 语境义';
+});
+$('fillSource').addEventListener('change', async () => {
+  const source = $('fillSource').value === '1' ? 'free' : 'ai';
+  await chrome.storage.local.set({ fillSource: source });
+  $('status').textContent = `补充词义来源：${source === 'free' ? '免费翻译接口' : 'AI 语境义'}`;
+});
+$('freeEndpoint').addEventListener('change', async () => {
+  await chrome.storage.local.set({ freeEndpoint: $('freeEndpoint').value.trim() });
+  $('status').textContent = $('freeEndpoint').value.trim() ? '免费翻译接口已保存' : '免费翻译接口已清空';
+});
 
 // Feature switches save immediately; content scripts pick them up through storage.onChanged
 const SWITCH_NAMES = {
@@ -272,6 +347,52 @@ $('speedTest').addEventListener('click', () => busy(async () => {
     setDiag(`速度测试在第 ${step}/3 次失败：` + err.message, 'err');
   }
 }));
+
+// ---------- cache management ----------
+// Cache entries are the ones the background writes: word/sentence/segment/bulk word keys.
+const CACHE_PREFIXES = ['w2:', 'w3:', 's2:', 's3:', 'seg2:', 'seg3:', 'c2:', 'c3:', 'bw:'];
+const isCacheKey = k => CACHE_PREFIXES.some(p => k.startsWith(p));
+
+async function cacheStats() {
+  const all = await chrome.storage.local.get(null);
+  let entries = 0;
+  for (const [k, v] of Object.entries(all)) {
+    if (isCacheKey(k)) entries++;
+  }
+  const bytes = new Blob([JSON.stringify(all)]).size;
+  return { entries, bytes };
+}
+
+$('cacheInfo').addEventListener('click', async () => {
+  const { entries, bytes } = await cacheStats();
+  $('cacheNote').textContent = `缓存条目：${entries} 条，约 ${(bytes / 1024).toFixed(1)} KB。`;
+});
+
+$('clearCache').addEventListener('click', async () => {
+  const all = await chrome.storage.local.get(null);
+  const keys = Object.keys(all).filter(isCacheKey);
+  if (!keys.length) { $('cacheNote').textContent = '缓存已经是空的。'; return; }
+  await chrome.storage.local.remove(keys);
+  $('cacheNote').textContent = `已清空 ${keys.length} 条缓存（设置和预设不受影响）。`;
+});
+
+// Standalone fill (with retry): inject the script if needed, then run only the vocabulary fill phase
+$('fillNow').addEventListener('click', async () => {
+  const { apiKey, model } = await chrome.storage.local.get({ apiKey: '', model: '' });
+  const { endpoint } = await chrome.storage.local.get({ endpoint: DEFAULTS.endpoint });
+  if (!model) { $('status').textContent = '请先选择并保存模型名'; return; }
+  if (!apiKey && !isLocal(endpoint)) { $('status').textContent = '请先填写并保存 API Key'; return; }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.id) { $('status').textContent = '找不到当前标签页'; return; }
+  try {
+    await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ['content.css'] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+    await chrome.tabs.sendMessage(tab.id, { type: 'fill' });
+    $('status').textContent = '已开始补充词义，结果显示在页面右下角';
+  } catch (err) {
+    $('status').textContent = '无法在此页面运行：' + err.message;
+  }
+});
 
 $('run').addEventListener('click', async () => {
   const { apiKey, model } = await chrome.storage.local.get({ apiKey: '', model: '' });

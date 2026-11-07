@@ -21,48 +21,129 @@
   .switch { display: flex; align-items: center; gap: 8px; margin-top: 6px; color: #1f2937; font-size: 13px; cursor: pointer; }
   .switch input { width: auto; margin: 0; }
   .sub { color: #6b7280; font-size: 12px; margin-top: 4px; }
+  .slider-label { display: block; margin-top: 8px; color: #1f2937; font-size: 13px; }
+  .slider-label input[type=range] { width: 100%; margin-top: 4px; }
+  #fillSourceLabel { font-weight: 600; color: #2563eb; }
+  /* tab bar + breadcrumb instead of separator lines */
+  .tabs { display: flex; gap: 2px; margin-top: 6px; border-bottom: 1px solid #e5e7eb; }
+  .tab {
+    flex: 1; padding: 6px 4px; text-align: center; font-size: 12px; color: #6b7280;
+    background: transparent; border: 0; border-bottom: 2px solid transparent; cursor: pointer; border-radius: 0;
+  }
+  .tab:hover { color: #2563eb; }
+  .tab.active { color: #2563eb; border-bottom-color: #2563eb; font-weight: 600; }
+  .panel { display: none; margin-top: 10px; }
+  .panel.active { display: block; }
+  .crumbs { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #9ca3af; margin-bottom: 6px; }
+  .crumbs b { color: #2563eb; font-weight: 600; }
+  .crumbs .sep { color: #d1d5db; }
+  /* compact progress mirror in the popup */
+  #miniProgress { margin-top: 10px; padding-top: 8px; border-top: 1px solid #e5e7eb; }
+  .tabs.mini { border-bottom: 0; gap: 8px; margin-top: 2px; }
+  .mini-stop { flex: 1; text-align: center; font-size: 11px; color: #9ca3af; display: flex; align-items: center; justify-content: center; gap: 4px; }
+  .mini-dot { width: 8px; height: 8px; border-radius: 50%; background: #e5e7eb; border: 1px solid #d1d5db; box-sizing: border-box; }
+  .mini-stop.active { color: #2563eb; font-weight: 600; }
+  .mini-stop.active .mini-dot { background: #3b82f6; border-color: #3b82f6; }
+  .mini-stop.done { color: #059669; }
+  .mini-stop.done .mini-dot { background: #10b981; border-color: #10b981; }
+  .mini-bar { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  #miniBarFill { height: 100%; width: 0; background: #3b82f6; transition: width .25s ease; }
+  #miniDetail { font-size: 11px; color: #6b7280; margin-top: 5px; }
 </style>
 </head>
 <body>
   <h1>Word Hover 释义助手</h1>
-  <label>当前预设<select id="presetSelect"></select></label>
-  <label>预设名称<input id="presetName" type="text" placeholder="例如：DeepSeek / 本机 Ollama"></label>
-  <div class="row">
-    <button id="newPreset" class="secondary">新建预设</button>
-    <button id="ollamaPreset" class="secondary">本机 Ollama</button>
-    <button id="deletePreset" class="secondary">删除预设</button>
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tab="model">模型</button>
+    <button class="tab" data-tab="features">功能</button>
+    <button class="tab" data-tab="fill">补充词义</button>
+    <button class="tab" data-tab="debug">调试</button>
   </div>
-  <label>API Key（本机 Ollama 可留空，仅保存在本机）
-    <input id="apiKey" type="password" placeholder="sk-...">
-  </label>
-  <label>API 地址（OpenAI 兼容）
-    <input id="endpoint" type="text">
-  </label>
-  <label>模型名
-    <input id="model" type="text" list="modelList">
-    <datalist id="modelList"></datalist>
-  </label>
-  <div class="row">
-    <button id="fetchModels" class="secondary">获取模型</button>
-    <button id="testConn" class="secondary">连通性测试</button>
-    <button id="speedTest" class="secondary">速度测试</button>
-  </div>
-  <div class="row">
-    <button id="save" class="secondary">保存设置</button>
-    <button id="run">分析本页</button>
-  </div>
-  <div class="toggles">
-    <label class="switch"><input id="hoverEnabled" type="checkbox"> 单词 / 词组悬浮释义</label>
-    <label class="switch"><input id="shiftEnabled" type="checkbox"> 按住 Shift 查看句意</label>
-    <label class="switch"><input id="ctrlEnabled" type="checkbox"> 按住 Ctrl 查看成分含义</label>
-  </div>
-  <div class="toggles">
-    <div class="sub">调试：不按快捷键直接显示（用于排查快捷键问题）</div>
-    <label class="switch"><input id="dbgSentence" type="checkbox"> 直接显示句意</label>
-    <label class="switch"><input id="dbgChunk" type="checkbox"> 直接显示成分</label>
-    <label class="switch"><input id="hoverPhraseOnly" type="checkbox"> 悬停只显示词组（关闭单词悬停）</label>
-  </div>
+
+  <section class="panel active" data-panel="model">
+    <div class="crumbs"><b>设置</b><span class="sep">›</span>模型与接口</div>
+    <label>当前预设<select id="presetSelect"></select></label>
+    <label>预设名称<input id="presetName" type="text" placeholder="例如：DeepSeek / 本机 Ollama"></label>
+    <div class="row">
+      <button id="newPreset" class="secondary">新建预设</button>
+      <button id="ollamaPreset" class="secondary">本机 Ollama</button>
+      <button id="deletePreset" class="secondary">删除预设</button>
+    </div>
+    <label>API Key（本机 Ollama 可留空，仅保存在本机）
+      <input id="apiKey" type="password" placeholder="sk-...">
+    </label>
+    <label>API 地址（OpenAI 兼容）
+      <input id="endpoint" type="text">
+    </label>
+    <label>模型名
+      <input id="model" type="text" list="modelList">
+      <datalist id="modelList"></datalist>
+    </label>
+    <div class="row">
+      <button id="fetchModels" class="secondary">获取模型</button>
+      <button id="testConn" class="secondary">连通性测试</button>
+      <button id="speedTest" class="secondary">速度测试</button>
+    </div>
+    <div class="row">
+      <button id="save" class="secondary">保存设置</button>
+      <button id="run">分析本页</button>
+    </div>
+  </section>
+
+  <section class="panel" data-panel="features">
+    <div class="crumbs"><b>设置</b><span class="sep">›</span>功能开关</div>
+    <div class="toggles" style="border-top:0;padding-top:0;margin-top:0">
+      <label class="switch"><input id="hoverEnabled" type="checkbox"> 单词 / 词组悬浮释义</label>
+      <label class="switch"><input id="shiftEnabled" type="checkbox"> 按住 Shift 查看句意</label>
+      <label class="switch"><input id="ctrlEnabled" type="checkbox"> 按住 Ctrl 查看成分含义</label>
+    </div>
+  </section>
+
+  <section class="panel" data-panel="fill">
+    <div class="crumbs"><b>设置</b><span class="sep">›</span>补充词义</div>
+    <div class="toggles" style="border-top:0;padding-top:0;margin-top:0">
+      <div class="sub">分析完成后，把剩下的词一次性翻译，适合要求每个词都有释义的场景。</div>
+      <label class="switch"><input id="fillAll" type="checkbox"> 补充全部词汇（跳过 the/a/is 等常见功能词）</label>
+      <label class="slider-label">来源：<span id="fillSourceLabel">AI 语境义</span>
+        <input id="fillSource" type="range" min="0" max="1" step="1" value="0">
+      </label>
+      <div class="sub">滑杆左端用当前 AI 模型；右端用下面的免费翻译接口（词典义，不结合语境）。</div>
+      <label>免费翻译接口（LibreTranslate 兼容，留空则只能用 AI）
+        <input id="freeEndpoint" type="text" placeholder="例如 http://localhost:5000">
+      </label>
+      <div class="row">
+        <button id="fillNow" class="secondary">单独补充词义（含重试）</button>
+      </div>
+      <div class="crumbs" style="margin-top:10px"><b>缓存</b><span class="sep">›</span>本地词义缓存</div>
+      <div class="row">
+        <button id="clearCache" class="secondary">清空缓存</button>
+        <button id="cacheInfo" class="secondary">查看缓存用量</button>
+      </div>
+      <div id="cacheNote" class="sub">缓存保存在本机，不会上传。同一页面重复悬停不会重复请求；中键可单独刷新某个词。</div>
+    </div>
+  </section>
+
+  <section class="panel" data-panel="debug">
+    <div class="crumbs"><b>设置</b><span class="sep">›</span>调试</div>
+    <div class="toggles" style="border-top:0;padding-top:0;margin-top:0">
+      <div class="sub">不按快捷键直接显示，用于排查快捷键问题。</div>
+      <label class="switch"><input id="dbgSentence" type="checkbox"> 直接显示句意</label>
+      <label class="switch"><input id="dbgChunk" type="checkbox"> 直接显示成分</label>
+      <label class="switch"><input id="hoverPhraseOnly" type="checkbox"> 悬停只显示词组（关闭单词悬停）</label>
+    </div>
+  </section>
+
   <div id="status"></div>
+  <div id="miniProgress">
+    <div class="crumbs"><b>当前页面</b><span class="sep">›</span><span id="miniStage">未开始分析</span></div>
+    <div class="tabs mini">
+      <div class="mini-stop" data-key="words"><span class="mini-dot"></span>词语</div>
+      <div class="mini-stop" data-key="chunks"><span class="mini-dot"></span>成分</div>
+      <div class="mini-stop" data-key="fill"><span class="mini-dot"></span>补充</div>
+    </div>
+    <div class="mini-bar"><div id="miniBarFill"></div></div>
+    <div id="miniDetail">打开网页后点“分析本页”开始</div>
+  </div>
   <div id="diag"></div>
   <div class="hint">本机 Ollama 可填 http://localhost:11434/v1，API Key 留空，模型名填已下载的模型。切换预设立即生效；分析时会把页面文字发送到当前接口。</div>
   <script src="popup.js"></script>

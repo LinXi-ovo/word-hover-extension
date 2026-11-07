@@ -26,8 +26,8 @@
   // User switches (popup). Both default to on; changes apply live via storage.onChanged.
   // dbgSentence / dbgChunk: show sentence meaning / constituent on hover without holding Shift / Ctrl (debug).
   // hoverScope: 'word' = words and annotated phrases; 'phrase' = annotated phrases only.
-  const SWITCHES = ['hoverEnabled', 'shiftEnabled', 'ctrlEnabled', 'dbgSentence', 'dbgChunk', 'hoverScope'];
-  const DEFAULT_SETTINGS = { hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true, dbgSentence: false, dbgChunk: false, hoverScope: 'word' };
+  const SWITCHES = ['hoverEnabled', 'shiftEnabled', 'ctrlEnabled', 'dbgSentence', 'dbgChunk', 'hoverScope', 'fillAll', 'fillSource'];
+  const DEFAULT_SETTINGS = { hoverEnabled: true, shiftEnabled: true, ctrlEnabled: true, dbgSentence: false, dbgChunk: false, hoverScope: 'word', fillAll: false, fillSource: 'ai' };
   const settings = { ...DEFAULT_SETTINGS };
   chrome.storage.local.get(DEFAULT_SETTINGS).then(s => Object.assign(settings, s));
   // Only switch changes affect the hover state. Cache writes (sentence/chunk results) also fire this
@@ -58,6 +58,114 @@
   document.documentElement.append(tip, toast);
 
   const hasHL = typeof CSS !== 'undefined' && !!CSS.highlights && typeof Highlight !== 'undefined';
+
+  // ---------- progress panel: railway line for stages, segmented bar for batches ----------
+  const STAGES = [
+    { key: 'words', label: '词语·词组·句意' },
+    { key: 'chunks', label: '成分' },
+    { key: 'fill', label: '补充' }
+  ];
+  const progress = { el: null, railDone: null, stops: {}, bar: null, detail: null, title: null };
+
+  function ensureProgress() {
+    if (progress.el) return;
+    const el = document.createElement('div');
+    el.id = 'dsh-progress';
+    const title = document.createElement('div');
+    title.className = 'dsh-pg-title';
+    title.textContent = '分析进度';
+    const rail = document.createElement('div');
+    rail.className = 'dsh-rail';
+    const done = document.createElement('div');
+    done.className = 'dsh-rail-done';
+    rail.appendChild(done);
+    for (const st of STAGES) {
+      const stop = document.createElement('div');
+      stop.className = 'dsh-stop';
+      stop.dataset.key = st.key;
+      const dot = document.createElement('div');
+      dot.className = 'dsh-dot';
+      const label = document.createElement('div');
+      label.className = 'dsh-stop-label';
+      label.textContent = st.label;
+      stop.append(dot, label);
+      rail.appendChild(stop);
+      progress.stops[st.key] = stop;
+    }
+    const bar = document.createElement('div');
+    bar.className = 'dsh-batchbar';
+    const detail = document.createElement('div');
+    detail.className = 'dsh-detail';
+    const actions = document.createElement('div');
+    actions.className = 'dsh-actions';
+    const close = document.createElement('button');
+    close.className = 'dsh-close';
+    close.textContent = '收起';
+    close.addEventListener('click', () => { el.style.display = 'none'; });
+    actions.appendChild(close);
+    el.append(title, rail, bar, detail, actions);
+    document.documentElement.appendChild(el);
+    Object.assign(progress, { el, railDone: done, bar, detail, title });
+  }
+
+  function showProgress(titleText) {
+    ensureProgress();
+    if (titleText) progress.title.textContent = titleText;
+    progress.el.style.display = 'block';
+  }
+
+  function hideProgressSoon() {
+    setTimeout(() => { if (progress.el) progress.el.style.display = 'none'; }, 4000);
+  }
+
+  // Mirror progress to the popup (and to any other extension view) every time the state changes
+  function broadcastProgress(stage, detail, pct) {
+    progress.lastPct = Math.max(0, Math.min(100, Math.round(pct || 0)));
+    try {
+      chrome.runtime.sendMessage({ type: 'progress', stage, detail: detail || '', pct: progress.lastPct, at: Date.now() }).catch(() => {});
+    } catch (_) { /* no receiver is fine */ }
+  }
+
+  // stage: 'words' | 'chunks' | 'fill'; skipped stages are drawn hollow
+  function setStage(stage, skipped = []) {
+    ensureProgress();
+    progress.currentStage = stage;
+    const idx = STAGES.findIndex(s => s.key === stage);
+    STAGES.forEach((s, i) => {
+      const stop = progress.stops[s.key];
+      stop.classList.toggle('active', i === idx);
+      stop.classList.toggle('done', i < idx);
+      stop.classList.toggle('skipped', skipped.includes(s.key));
+    });
+    const pct = idx <= 0 ? 0 : (idx / (STAGES.length - 1)) * 100;
+    progress.railDone.style.width = `calc(${pct}% * (100% - 12px) / 100%)`;
+    broadcastProgress(stage, progress.detail ? progress.detail.textContent : '', pct);
+  }
+
+  // items: total batches; done: finished; active: index running now (or -1)
+  function setBatch(total, doneCount, activeIdx, detailText) {
+    ensureProgress();
+    const n = Math.max(1, Math.min(total, 40));
+    if (progress.bar.childElementCount !== n) {
+      progress.bar.textContent = '';
+      for (let i = 0; i < n; i++) {
+        const b = document.createElement('div');
+        b.className = 'dsh-block';
+        progress.bar.appendChild(b);
+      }
+    }
+    const blocks = [...progress.bar.children];
+    blocks.forEach((b, i) => {
+      const filled = Math.round((doneCount / total) * n);
+      b.className = 'dsh-block' + (i < filled ? ' done' : i === activeIdx ? ' active' : '');
+    });
+    if (detailText != null) progress.detail.textContent = detailText;
+    // overall percent across the three stages: stage index offsets + progress inside the stage
+    const idx = STAGES.findIndex(s => s.key === (progress.currentStage || 'words'));
+    const inStage = total > 0 ? Math.min(1, doneCount / total) : 0;
+    const pct = ((Math.max(0, idx) + inStage) / STAGES.length) * 100;
+    broadcastProgress(progress.currentStage || 'words', detailText || '', pct);
+  }
 
   // ---------- helpers ----------
   // A newer message cancels the auto-hide of an older one, so phase-2 status is not hidden by phase-1 timers
@@ -128,22 +236,98 @@
     const MAX_CHUNKS = 8; // cost limit per click
     const todo = chunks.slice(0, MAX_CHUNKS);
     let marked = 0;
+    showProgress('分析进度');
+    setStage('words');
+    setBatch(todo.length, 0, 0, `词语 / 词组 / 句意：0/${todo.length} 段`);
     for (let i = 0; i < todo.length; i++) {
       showToast(`分析中 ${i + 1}/${todo.length}…`);
+      setBatch(todo.length, i, i, `词语 / 词组 / 句意：${i}/${todo.length} 段`);
       const res = await chrome.runtime.sendMessage({ type: 'annotate', text: todo[i], force });
       if (!res || res.error) {
         showToast('分析失败：' + (res && res.error ? res.error : '无响应'), 6000);
+        setBatch(todo.length, i, -1, '分析失败：' + (res && res.error ? res.error : '无响应'));
+        hideProgressSoon();
         return;
       }
       for (const it of res.items) {
         const term = it.text.trim();
         if (term && it.zh && wrapFirst(term, it.zh.trim())) marked++;
       }
+      setBatch(todo.length, i + 1, i + 1, `词语 / 词组 / 句意：${i + 1}/${todo.length} 段，已标注 ${marked} 个`);
     }
     const note = chunks.length > MAX_CHUNKS ? `（仅分析前 ${MAX_CHUNKS} 段）` : '';
     // Phase 1 is done and rendered. Phase 2 (constituents for the whole article) runs after it.
     segmentArticle(`已标注 ${marked} 个词条${note}。悬停任意单词查看释义。`, force);
   }
+
+  // Phase 3 (optional): translate every remaining word of the page, so hovering needs no request at all.
+  // Each word is sent with the sentence it appears in (context), and batches stream back to the progress bar.
+  const MAX_FILL_WORDS = 1200;
+  function fillRest(prefix = '') {
+    const words = buildFillWords();
+    if (!words.length) {
+      if (prefix) showToast(prefix, 8000);
+      setStage('fill', ['fill']);
+      hideProgressSoon();
+      return;
+    }
+    const { sentenceOf, sentences } = sentenceIndex();
+    setStage('fill');
+    const batchSize = (settings.fillSource === 'free') ? 5 : 60;
+    const blockCount = Math.max(1, Math.ceil(words.length / batchSize));
+    setBatch(blockCount, 0, 0, `补充词义：0/${words.length} 个词（来源：${settings.fillSource === 'free' ? '免费接口' : 'AI，含语境'}）`);
+    showToast(`补充词义中（${words.length} 个候选词，来源：${settings.fillSource === 'free' ? '免费翻译接口' : 'AI，带语境'}）…`);
+    askBg({ type: 'fillWords', words, sentenceOf, sentences, source: settings.fillSource || 'ai' }, res => {
+      if (res.error) {
+        showToast('补充词义失败：' + res.error, 10000);
+        setBatch(1, 0, -1, '补充词义失败：' + res.error);
+        hideProgressSoon();
+        return;
+      }
+      // Streaming: each batch pushes its words, so the bar fills gradually
+      fillHandlers.add(msg => {
+        for (const [w, zh] of Object.entries(msg.translations || {})) fillCache.set(w.toLowerCase(), zh);
+        const done = Number(msg.done) || 0;
+        setBatch(blockCount, Math.round((done / words.length) * blockCount), -1, `补充词义：${done}/${words.length} 个词（分批流式）`);
+      });
+    });
+  }
+
+  // word -> the sentence it was first found in (used as context for the bulk fill)
+  function sentenceIndex() {
+    const sentenceOf = {};
+    const sentences = collectSentences();
+    for (const s of sentences) {
+      const re = /[A-Za-z][A-Za-z'’-]*/g;
+      let m;
+      while ((m = re.exec(s))) {
+        const w = m[0].replace(/[-'’]+$/, '').toLowerCase();
+        if (w && !sentenceOf[w]) sentenceOf[w] = s;
+      }
+    }
+    return { sentenceOf, sentences };
+  }
+
+  // Distinct words on the page, skipping those already handled by the annotation or hover cache
+  function buildFillWords(limit = MAX_FILL_WORDS) {
+    const seen = new Set();
+    const words = [];
+    for (const n of textNodes()) {
+      const re = /[A-Za-z][A-Za-z'’-]*/g;
+      let m;
+      while ((m = re.exec(n.nodeValue))) {
+        const w = m[0].replace(/[-'’]+$/, '').toLowerCase();
+        if (w.length < 2 || seen.has(w)) continue;
+        seen.add(w);
+        words.push(w);
+        if (words.length >= limit) return words;
+      }
+    }
+    return words;
+  }
+
+  // Word -> Chinese gloss from phase 3; consulted before any per-sentence lookup
+  const fillCache = new Map();
 
   // Sentences of the page, split the same way sentenceAt() splits them, so cache keys line up with Ctrl lookups
   function collectSentences() {
@@ -178,24 +362,86 @@
   // Phase 2: send the article's sentences to the background once; it splits them into constituents and caches
   // each sentence, so Ctrl hovering needs no per-sentence request afterwards.
   const MAX_DOC_SENTENCES = 240;
+  // Streamed constituent blocks: each successful block is applied to the page as soon as it arrives.
+  // The handler is registered before the request so no early block is missed, and removed when the job ends.
+  // Streamed bulk-fill batches: each successful batch is applied to the page and to the progress bar at once
+  const fillHandlers = new Set();
+  chrome.runtime.onMessage.addListener(msg => {
+    if (msg && msg.type === 'fillpart') fillHandlers.forEach(fn => fn(msg));
+    return false;
+  });
+
+  const partHandlers = new Set();
+  chrome.runtime.onMessage.addListener(msg => {
+    if (msg && msg.type === 'part') {
+      partHandlers.forEach(fn => fn(msg));
+    }
+    return false;
+  });
+
   // prefix: phase-1 result, kept on screen together with the phase-2 status
   function segmentArticle(prefix = '', force = false) {
     const epoch = modelEpoch;
     const sents = collectSentences().slice(0, MAX_DOC_SENTENCES);
-    if (!sents.length) { showToast(prefix, 8000); return; }
-    showToast(`${prefix}成分分析中（${sents.length} 句，后台进行）…`);
-    askBg({ type: 'segmentDoc', sentences: sents, force }, res => {
-      if (epoch !== modelEpoch) return;
-      if (res.error) { showToast(`${prefix}成分分析失败：${res.error}`, 8000); return; }
+    const blocks = Math.max(1, Math.ceil(sents.length / 15));
+    setStage('chunks');
+    if (!sents.length) {
+      showToast(prefix, 8000);
+      setStage('chunks', ['chunks']);
+      if (settings.fillAll) fillRest(prefix); else hideProgressSoon();
+      return;
+    }
+
+    let jobId = null;
+    let streamed = 0;
+    let settled = false;
+    const finish = () => { settled = true; partHandlers.delete(onPart); };
+
+    const onPart = msg => {
+      if (settled || epoch !== modelEpoch) return;
+      if (jobId && msg.id !== jobId) return;
       let refreshCurrent = false;
-      for (const [sentence, segments] of Object.entries(res.segmentsBySentence || {})) {
+      for (const [sentence, segments] of Object.entries(msg.segmentsBySentence || {})) {
         segCache.set(sentence, segments);
         if (chunkKey.startsWith(sentence + '#')) refreshCurrent = true;
       }
+      streamed = Math.max(streamed, Number(msg.done) || 0);
       if (refreshCurrent) { renderedChunkKey = ''; chunkMode(mx, my); }
-      const miss = res.total - res.done;
-      showToast(`${prefix}成分已就绪：${res.done}/${res.total} 句${miss ? `（${miss} 句未成功，悬停时会单独重试）` : ''}。按住 Ctrl 悬停查看。`, 8000);
+      setBatch(blocks, Math.round((streamed / sents.length) * blocks), -1, `成分：${streamed}/${sents.length} 句（流式渲染中）`);
+    };
+    partHandlers.add(onPart);
+
+    setBatch(blocks, 0, 0, `成分：0/${sents.length} 句`);
+    showToast(`${prefix}成分分析中（${sents.length} 句，分块流式进行）…`);
+    askBg({ type: 'segmentDoc', sentences: sents, force }, res => {
+      if (epoch !== modelEpoch) { finish(); return; }
+      if (res.error) {
+        finish();
+        showToast(`${prefix}成分分析失败：${res.error}`, 8000);
+        setBatch(1, 0, -1, '成分分析失败：' + res.error);
+        hideProgressSoon();
+        return;
+      }
+      jobId = res.id;
     });
+    // Final result: the job reports total counts and any sentences still missing after the retry pass
+    const onResult = msg => {
+      if (!msg || msg.type !== 'result' || (jobId && msg.id !== jobId)) return;
+      if (epoch !== modelEpoch) { finish(); return; }
+      finish();
+      const data = msg.ok ? msg.data : null;
+      const done = data ? data.done : streamed;
+      const total = data ? data.total : sents.length;
+      const miss = total - done;
+      setBatch(blocks, blocks, -1, `成分已就绪：${done}/${total} 句`);
+      if (settings.fillAll) fillRest(`${prefix}成分已就绪：${done}/${total} 句。`);
+      else {
+        showToast(`${prefix}成分已就绪：${done}/${total} 句${miss ? `（${miss} 句未成功，悬停时会单独重试）` : ''}。按住 Ctrl 悬停查看。`, 8000);
+        hideProgressSoon();
+      }
+      chrome.runtime.onMessage.removeListener(onResult);
+    };
+    chrome.runtime.onMessage.addListener(onResult);
   }
 
   // ---------- hover ----------
@@ -592,6 +838,9 @@
 
     // Update the visible word immediately; the network response arrives asynchronously.
     if (memCache.has(key)) { showTip(w.word, memCache.get(key), false); return; }
+    // Phase 3 (fill all words) already produced a gloss for this word: show it without any request
+    const filled = fillCache.get(w.word.toLowerCase());
+    if (filled) { showTip(w.word, filled, false); return; }
     showWordMeaning(w, key, false);
   });
 
@@ -657,6 +906,24 @@
     if (msg.type === 'start') {
       analyze(!!msg.force).catch(err => showToast('分析出错：' + err.message, 6000));
       sendResponse({ ok: true });
+    }
+    // Standalone fill: retry words that are still untranslated without re-running the analysis phases
+    if (msg.type === 'progressState') {
+      sendResponse({
+        stage: progress.currentStage || null,
+        detail: progress.detail ? progress.detail.textContent : '',
+        pct: progress.lastPct || 0
+      });
+    }
+    if (msg.type === 'fill') {
+      try {
+        showProgress('补充词义');
+        setStage('fill');
+        fillRest('单独补充词义：');
+        sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({ error: err.message });
+      }
     }
     return false;
   });

@@ -32,3 +32,111 @@
 ::highlight(dsh-hover) {
   background-color: #e0e7ff;
 }
+/* progress panel: railway line for the three stages, chunky bar for batches inside a stage */
+#dsh-progress {
+  position: fixed;
+  right: 16px;
+  bottom: 56px;
+  z-index: 2147483647;
+  display: none;
+  width: 300px;
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 10px 12px 12px;
+  border-radius: 8px;
+  font: 12px/1.4 "Microsoft YaHei", "Segoe UI", sans-serif;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .35);
+}
+#dsh-progress .dsh-pg-title { font-weight: 600; color: #f8fafc; margin-bottom: 8px; }
+#dsh-progress .dsh-rail {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  margin: 0 4px 10px;
+  padding-top: 10px;
+}
+
+/* the thin rail itself */
+#dsh-progress .dsh-rail::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  top: 15px;
+  height: 2px;
+  background: #334155;
+  border-radius: 1px;
+}
+#dsh-progress .dsh-rail-done {
+  position: absolute;
+  left: 6px;
+  top: 15px;
+  height: 2px;
+  background: #38bdf8;
+  border-radius: 1px;
+  width: 0;
+  transition: width .3s ease;
+}
+#dsh-progress .dsh-stop {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  width: 33%;
+}
+#dsh-progress .dsh-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #334155;
+  border: 2px solid #64748b;
+  box-sizing: border-box;
+  transition: background .2s, border-color .2s;
+}
+#dsh-progress .dsh-stop.active .dsh-dot {
+  background: #38bdf8;
+  border-color: #7dd3fc;
+  box-shadow: 0 0 0 4px rgba(56, 189, 248, .18);
+}
+#dsh-progress .dsh-stop.done .dsh-dot {
+  background: #22c55e;
+  border-color: #4ade80;
+}
+#dsh-progress .dsh-stop.skipped .dsh-dot {
+  background: #0f172a;
+  border-color: #475569;
+}
+#dsh-progress .dsh-stop-label { color: #94a3b8; font-size: 11px; white-space: nowrap; }
+#dsh-progress .dsh-stop.active .dsh-stop-label { color: #e0f2fe; }
+#dsh-progress .dsh-stop.done .dsh-stop-label { color: #bbf7d0; }
+
+/* batch progress inside the current stage: segmented blocks */
+#dsh-progress .dsh-batchbar {
+  display: flex;
+  gap: 2px;
+  height: 12px;
+  margin-bottom: 6px;
+}
+#dsh-progress .dsh-block {
+  flex: 1;
+  background: #334155;
+  border-radius: 2px;
+  transition: background .2s;
+}
+#dsh-progress .dsh-block.done { background: #22c55e; }
+#dsh-progress .dsh-block.active { background: #fbbf24; animation: dsh-pulse 1.1s ease-in-out infinite; }
+@keyframes dsh-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+#dsh-progress .dsh-detail { color: #94a3b8; min-height: 16px; }
+#dsh-progress .dsh-actions { display: flex; justify-content: flex-end; margin-top: 6px; }
+#dsh-progress .dsh-close {
+  pointer-events: auto;
+  background: transparent;
+  color: #94a3b8;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+#dsh-progress .dsh-close:hover { color: #e2e8f0; border-color: #64748b; }

@@ -86,26 +86,108 @@ function finishJob(job, body) {
   chrome.tabs.sendMessage(job.tabId, { type: 'result', id: job.id, ...body }).catch(() => {});
 }
 
-// Whole-article segmentation: runs in the background after the tab gets an immediate "queued" reply, and the
-// final counts are pushed back as a 'result' message. Each sentence goes through segmentCore, so its result
-// is cached per sentence; later Ctrl hovers read the cache. Failed sentences are simply left for a later hover.
+// ---------- batched segmentation: one request per block of sentences, streamed back block by block ----------
+const SEG_BLOCK = 15;      // sentences per request
+const SEG_BLOCK_RETRY = 2; // a failed block is retried this many times before it is reported as failed
+
+// Split a block of sentences in one request. Returns { [sentence]: segments } for the sentences that aligned.
+async function segmentBlock(sentences, tries) {
+  const numbered = sentences.map((s, i) => `[${i}] ${s}`).join('\n');
+  const out = await callJSON(
+    'Split each numbered English sentence below into consecutive constituents that together cover every word, ' +
+    'in order, without overlap. A constituent is a grammatical unit larger than a phrase and smaller than the sentence: ' +
+    'a noun phrase with its modifiers, a coordinated structure, a subordinate clause, a prepositional or with-phrase adverbial, ' +
+    'or a verb phrase with its object or complement. ' +
+    'Each "text" must be copied exactly from that sentence. Each "zh" is a short Chinese gloss of the unit, at most 25 characters. ' +
+    'Return JSON {"sentences":[{"i":0,"units":[{"text":"...","zh":"..."}]}]} covering every input sentence.\n\nSENTENCES:\n' + numbered,
+    32768, SYS_SEG, tries
+  );
+  const map = {};
+  const list = Array.isArray(out.sentences) ? out.sentences : [];
+  for (const item of list) {
+    const idx = Number(item && item.i);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= sentences.length) continue;
+    const sentence = sentences[idx];
+    const segs = alignSegments(sentence, item && item.units);
+    if (segs) map[sentence] = segs;
+  }
+  return map;
+}
+
+// One block with cache lookups; only sentences not already cached go to the model
+async function segmentBlockCached(sentences, force, tries) {
+  const scope = await cacheScope();
+  const result = {};
+  const need = [];
+  for (const s of sentences) {
+    const key = 'seg3:' + scope + ':' + s.length + '.' + hashKey(s);
+    const prev = await cacheGetRaw(key);
+    if (!force && isFresh(prev)) { result[s] = prev.v; continue; }
+    need.push({ s, key, prev });
+  }
+  if (need.length) {
+    const got = await segmentBlock(need.map(n => n.s), tries);
+    for (const n of need) {
+      const segs = got[n.s];
+      if (!segs) continue;
+      await cacheSave(n.key, segs, n.prev);
+      result[n.s] = segs;
+    }
+  }
+  return result;
+}
+
+// Whole-article segmentation, streamed: each successful block is pushed to the tab immediately; a block that still
+// fails after its retries is queued for a later pass (added to the end) instead of blocking the rest.
 async function segmentDocJob(sentences, job) {
+  const blocks = [];
+  for (let i = 0; i < sentences.length; i += SEG_BLOCK) blocks.push(sentences.slice(i, i + SEG_BLOCK));
   let done = 0;
-  const total = sentences.length;
-  const segmentsBySentence = {};
   let next = 0;
-  const worker = async () => {
-    while (next < total) {
-      const s = sentences[next++];
-      try {
-        const result = await segmentCore({ sentence: s, force: !!job.force }, 2);
-        segmentsBySentence[s] = result.segments;
-        done++;
-      } catch (_) { /* leave it; hover will retry this sentence */ }
+  const deferred = []; // failed blocks, retried after the first pass
+  const total = sentences.length;
+
+  const send = data => {
+    chrome.tabs.sendMessage(job.tabId, {
+      type: 'part', id: job.id,
+      segmentsBySentence: Object.fromEntries(Object.entries(data).map(([s, segs]) => [s, segs])),
+      done, total
+    }).catch(() => {});
+  };
+
+  const worker = async pool => {
+    while (next < pool.length) {
+      const block = pool[next++];
+      let got = null;
+      for (let attempt = 1; attempt <= SEG_BLOCK_RETRY && !got; attempt++) {
+        try {
+          got = await segmentBlockCached(block, !!job.force, 1);
+        } catch (err) {
+          if (attempt === SEG_BLOCK_RETRY) { deferred.push(block); break; }
+          await sleep(1500 * attempt);
+        }
+      }
+      if (got && Object.keys(got).length) {
+        done += Object.keys(got).length;
+        send(got); // stream this block to the page now
+      }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT, total) }, worker));
-  return { done, total, segmentsBySentence };
+  await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT, blocks.length) }, () => worker(blocks)));
+
+  // Second pass: blocks that failed are retried at the end, one attempt each
+  if (deferred.length) {
+    for (const block of deferred) {
+      try {
+        const got = await segmentBlockCached(block, false, 1);
+        if (got && Object.keys(got).length) {
+          done += Object.keys(got).length;
+          send(got);
+        }
+      } catch (_) { /* still failing: leave for a later Ctrl hover */ }
+    }
+  }
+  return { done, total };
 }
 
 function startSegmentDoc(msg, sender) {
@@ -116,7 +198,7 @@ function startSegmentDoc(msg, sender) {
   const job = { id: 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), tabId, force: !!msg.force };
   segmentDocJob(sentences, job).then(data => finishJob(job, { ok: true, data }))
     .catch(err => finishJob(job, { ok: false, error: err.message }));
-  return Promise.resolve({ queued: true, id: job.id });
+  return Promise.resolve({ queued: true, id: job.id, total: sentences.length });
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -126,6 +208,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'sentence') task = dispatch('sentence', msg, sender);
   if (msg.type === 'segment') task = dispatch('segment', msg, sender);
   if (msg.type === 'segmentDoc') task = startSegmentDoc(msg, sender);
+  if (msg.type === 'fillWords') task = startFillWords(msg, sender);
   // Settings-page tools: they use the form values passed in msg.cfg (not yet saved)
   if (msg.type === 'listModels') task = listModels(msg);
   if (msg.type === 'testConnection') task = testConnection(msg);
@@ -383,6 +466,175 @@ function alignSegments(sent, units) {
     s.text = sent.slice(s.start, s.end).trim();
   });
   return segs.filter(s => s.text);
+}
+
+// ---------- bulk vocabulary fill: translate the remaining words of a page ----------
+// Only closed-class grammar words are skipped: articles/determiners, pronouns, prepositions, conjunctions and the
+// core auxiliary/copula verbs. Content words (authorities, remarkable, significant, ...) are always translated.
+// The list may grow; keep it to words with no useful standalone meaning.
+const STOP_WORDS = new Set((
+  'a an the this that these those some any each every no other another such both all either neither ' +
+  'my your his her its our their whose what which ' +
+  'i me we us you he him she her it they them myself yourself himself herself itself ourselves yourselves themselves ' +
+  'who whom whoever whatever nobody somebody anybody everyone someone anyone something anything nothing ' +
+  'of in on at to for from by with about into onto upon within without through throughout during before after ' +
+  'above below under over between among against across along around behind beside beyond near off past since till ' +
+  'toward towards until via per than as like despite except ' +
+  'and or but if then because while although though unless whether so yet nor ' +
+  'be am is are was were been being have has had having do does did doing ' +
+  'will would shall should can could may might must ' +
+  "it's i'm you're he's she's they're we're that's there's isn't aren't wasn't weren't don't doesn't didn't " +
+  "can't couldn't won't wouldn't shouldn't s t re ve ll d m"
+).split(/\s+/).filter(Boolean));
+
+function isFunctionWord(w) {
+  return STOP_WORDS.has(w.toLowerCase());
+}
+
+function isMissing(err) {
+  return /404|405|not found|not support/i.test(String(err && err.message));
+}
+
+// One batch of words -> meanings, from the AI or from the free-translation endpoint.
+// entries: [{ word, sentence }] where sentence is the sentence the word first appeared in. The AI gets each
+// word together with its sentence, so polysemous words get the meaning used in this article, not a generic one.
+async function translateBatch(entries, source, topic) {
+  const words = entries.map(e => e.word);
+  if (source === 'free') return freeTranslate(words);
+  const lines = entries.map(e => `- "${e.word}"${e.sentence ? `  ← «${e.sentence}»` : ''}`).join('\n');
+  const out = await callJSON(
+    'Translate each English word below into a concise Chinese meaning (at most 15 Chinese characters each). ' +
+    'Each word is shown with the sentence it comes from: give the meaning it has IN THAT SENTENCE, not a generic dictionary sense. ' +
+    (topic ? `The text is about: ${topic}. ` : '') +
+    'Return JSON {"items":[{"word":"...","zh":"..."}]} with one item per input word, in the same order.\n\nWORDS WITH CONTEXT:\n' + lines,
+    16384, SYS_WORD
+  );
+  const items = Array.isArray(out.items) ? out.items : [];
+  const map = {};
+  for (const it of items) {
+    const w = String((it && it.word) || '').trim().toLowerCase();
+    const zh = String((it && it.zh) || '').trim();
+    if (w && zh) map[w] = zh;
+  }
+  return map;
+}
+
+// Free dictionary/translation endpoint (no key): expects { endpoint: 'https://host/', word: '...' } and returns
+// a Chinese gloss; accepts the common JSON shapes used by LibreTranslate-like services and Google's free endpoint.
+async function freeTranslateOne(word, cfg) {
+  const base = String(cfg.freeEndpoint || '').trim();
+  if (!base) throw new Error('未填写免费翻译接口地址');
+  const isGoogleLt = /translate\.googleapis\.com/.test(base);
+  let url, init;
+  if (isGoogleLt) {
+    const u = new URL(base);
+    u.searchParams.set('q', word);
+    if (!u.searchParams.get('target')) u.searchParams.set('target', 'zh-CN');
+    url = u.toString();
+    init = { method: 'GET' };
+  } else {
+    url = base.replace(/\/+$/, '') + '/translate';
+    init = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: word, source: 'en', target: 'zh', format: 'text' })
+    };
+  }
+  const r = await fetch(url, init);
+  if (!r.ok) throw new Error(`免费接口 HTTP ${r.status}`);
+  const data = await r.json();
+  const text =
+    (data && data.translatedText) ||
+    (data && data.translation) ||
+    (data && data.result) ||
+    (Array.isArray(data && data.sentences) ? data.sentences.map(s => s.trans).join('') : '') ||
+    '';
+  const zh = String(text).trim();
+  if (!zh) throw new Error('免费接口没有返回译文');
+  return zh;
+}
+
+async function freeTranslate(words) {
+  const cfg = await chrome.storage.local.get({ freeEndpoint: '' });
+  const map = {};
+  for (const w of words) {
+    try { map[w.toLowerCase()] = await freeTranslateOne(w, cfg); } catch (_) { /* leave it for next time */ }
+  }
+  return map;
+}
+
+// Fill meanings for every word of the page that is neither function word, nor already translated, nor cached.
+// Words are sent in batches with their sentences (context) and streamed back to the page batch by batch.
+async function fillWords({ words, sentenceOf, topic, source }, job) {
+  const list = Array.isArray(words) ? [...new Set(words.map(w => String(w || '').trim()).filter(Boolean))] : [];
+  const wanted = list.filter(w => !isFunctionWord(w));
+  const scope = await cacheScope();
+  const result = {};
+  const missing = [];
+  for (const w of wanted) {
+    const key = 'bw:' + scope + ':' + w.toLowerCase();
+    const prev = await cacheGetRaw(key);
+    if (isFresh(prev)) { result[w] = prev.v; continue; }
+    missing.push(w);
+  }
+  // AI: small batches return fast and stream early; the free endpoint does one word per HTTP call.
+  const BATCH = source === 'free' ? 5 : 20;
+  const batches = [];
+  for (let i = 0; i < missing.length; i += BATCH) {
+    batches.push(missing.slice(i, i + BATCH).map(w => ({
+      word: w,
+      sentence: sentenceOf && sentenceOf[w] ? String(sentenceOf[w]).slice(0, 400) : ''
+    })));
+  }
+  let done = Object.keys(result).length;
+  const total = wanted.length;
+  const push = data => {
+    chrome.tabs.sendMessage(job.tabId, {
+      type: 'fillpart', id: job.id, translations: data, done, total, batches: batches.length
+    }).catch(() => {});
+  };
+  if (done) push({}); // already-cached words are reported at once
+
+  let next = 0;
+  const worker = async () => {
+    while (next < batches.length) {
+      const batch = batches[next++];
+      try {
+        const got = await translateBatch(batch, source, topic);
+        const fresh = {};
+        const saves = [];
+        for (const [w, zh] of Object.entries(got)) {
+          if (!zh) continue;
+          result[w] = zh;
+          fresh[w] = zh;
+          // cache writes are independent: issue them together instead of awaiting each one
+          saves.push(cacheGetRaw('bw:' + scope + ':' + w)
+            .then(prev => cacheSave('bw:' + scope + ':' + w, zh, prev)));
+        }
+        done = Object.keys(result).length;
+        // Stream this batch to the page before the cache writes finish, so the bar moves immediately
+        if (Object.keys(fresh).length) push(fresh);
+        await Promise.all(saves);
+      } catch (err) {
+        if (source !== 'free' && isMissing(err)) throw new Error('当前接口不支持批量补词');
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT, Math.max(1, batches.length)) }, worker));
+  done = Object.keys(result).length;
+  return { total, done, missing: total - done };
+}
+
+// Standalone fill: answered immediately, batches stream back as 'fillpart' messages, final counts as 'result'
+function startFillWords(msg, sender) {
+  const tabId = sender && sender.tab ? sender.tab.id : null;
+  if (tabId == null) return Promise.reject(new Error('缺少标签页信息'));
+  const job = { id: 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), tabId };
+  const first = msg.sentences && msg.sentences[0] ? String(msg.sentences[0]).slice(0, 120) : '';
+  fillWords({ words: msg.words, sentenceOf: msg.sentenceOf || {}, topic: first, source: msg.source }, job)
+    .then(data => finishJob(job, { ok: true, data }))
+    .catch(err => finishJob(job, { ok: false, error: err.message }));
+  return Promise.resolve({ queued: true, id: job.id });
 }
 
 // Pick learnable words/phrases in a chunk of page text
